@@ -1,0 +1,1 @@
+"""My Download Manager application package."""
