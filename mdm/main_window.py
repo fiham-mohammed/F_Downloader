@@ -468,7 +468,7 @@ class MainWindow(QMainWindow):
                 layout.addWidget(button)
 
         layout.addStretch()
-        version = QLabel("MY DOWNLOAD MANAGER\nStage 2 • Real Download Engine")
+        version = QLabel("MY DOWNLOAD MANAGER\nStage 3 • Multi-Connection Engine")
         version.setObjectName("Muted")
         version.setStyleSheet("font-size: 8pt;")
         layout.addWidget(version)
@@ -596,7 +596,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(panel, 1)
 
         footer = QLabel(
-            "Stage 2 Engine: Direct HTTP/HTTPS downloads with automatic retry, queueing, and stream safety."
+            "Stage 3 Engine: Advanced multi-connection downloading with HTTP Range requests, dynamic segment merging, and stream safety."
         )
         footer.setObjectName("Muted")
         footer.setWordWrap(True)
@@ -676,7 +676,7 @@ class MainWindow(QMainWindow):
             "• Exact non-overlapping segment calculations and parallel ThreadPoolExecutor streaming.\n"
             "• Real-time segment progress tracking, active connections counter, and segment-details view.\n"
             "• Per-segment independent retries for transient server/network errors.\n"
-            "• Safe byte-ordered segment concatenation and final checksum/size verification.\n"
+            "• Safe byte-ordered segment concatenation and final exact size and boundary verification.\n"
             "• Safe no-overwrite finalisation and automatic temporary file cleanup.\n\n"
             "Upcoming stages will introduce SQLite history persistence, pause/resume, and browser extensions."
         )

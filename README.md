@@ -4,7 +4,7 @@ A modern Windows desktop application built with Python 3.13, PySide6, and HTTPX.
 
 Stage 3 introduces an advanced **multi-connection download engine** inspired by Internet Download Manager (IDM), accelerating downloads using simultaneous HTTP Range requests with automatic single-connection fallback, independent per-segment retries, exact byte-ordered merging, and real-time segment monitoring.
 
-The application has passed all **48 automated regression tests** with 100% success.
+The application has passed all **59 automated regression tests** with 100% success.
 
 ---
 
@@ -72,7 +72,7 @@ MyDownloadManager/
 │
 └── tests/
     ├── test_downloader.py              # Stage 2 regression test suite (26 tests)
-    └── test_segmented_downloader.py    # Stage 3 multi-connection test suite (22 tests)
+    └── test_segmented_downloader.py    # Stage 3 multi-connection test suite (33 tests)
 ```
 
 ---
@@ -113,7 +113,7 @@ python app.py
 
 ## Running the Automated Test Suite
 
-The test suite contains **48 automated tests** executed self-contained and socket-free via `httpx.MockTransport`:
+The test suite contains **59 automated tests** executed self-contained and socket-free via `httpx.MockTransport`:
 
 ```powershell
 python -m unittest discover -s tests -v
@@ -121,7 +121,7 @@ python -m unittest discover -s tests -v
 
 ### Coverage Breakdown:
 - **`tests/test_downloader.py` (26 tests):** Small/large file downloads, HTTP redirects, Content-Disposition priority, user explicit overrides, cancellation, graceful shutdown, shutdown timeout reference preservation (QueueManager), close-event rejection and retry dialog (MainWindow), disk permission and disk-full errors, permanent 404s, transient 503 retries, dashboard retry metrics, Windows filename sanitization (`CON.foo.bar`), collision-safe finalisation under race conditions, format utilities, and Qt UI integration.
-- **`tests/test_segmented_downloader.py` (22 tests):**
+- **`tests/test_segmented_downloader.py` (33 tests):**
   1. Server supporting HTTP Range requests.
   2. Server rejecting HTTP Range requests (fallback).
   3. Server returning HTTP 200 instead of HTTP 206 (fallback).
@@ -135,15 +135,26 @@ python -m unittest discover -s tests -v
   11. Incorrect Content-Range responses.
   12. Incomplete segment responses.
   13. Segment network failure and retry.
-  14. Cancellation during parallel downloading.
+  14. Cancellation during parallel downloading (verified active workers, prompt cleanup).
   15. Unknown file-size fallback.
   16. Small-file fallback (< 2 MB).
   17. ETag or Last-Modified validation.
   18. Duplicate destination filename protection.
   19. Final file size verification.
-  20. GUI responsiveness during parallel downloading.
-  21. Cleanup of temporary segment files.
+  20. Real QThread GUI responsiveness and signal delivery during parallel downloading.
+  21. Cleanup of temporary segment files and directories.
   22. Single-connection fallback after Range rejection.
+  23. Concurrency test: 2 connections (tracking simultaneous requests).
+  24. Concurrency test: 4 connections (verified parallel overlap without exceeding limit).
+  25. Concurrency test: 8 connections (verified parallel overlap without exceeding limit).
+  26. Concurrency test: 16 connections (verified parallel overlap without exceeding limit).
+  27. RFC 7232/9110 validator helper: Strong vs. Weak ETag discrimination.
+  28. Validator consistency: Weak ETags omitted from If-Range in favor of Last-Modified.
+  29. Server validator mutation mid-download triggers clean single-connection fallback.
+  30. Strict Content-Range probe validation failure triggers graceful fallback.
+  31. Segment Content-Length header mismatch fails safely and purges temporary files.
+  32. Monotonic wire-streamed speed calculation during segment retry cycles.
+  33. Immediate sibling stream abort and thread unblocking on fatal segment errors.
 
 ---
 

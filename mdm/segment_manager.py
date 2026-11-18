@@ -33,9 +33,22 @@ class RangeNotSupportedError(Exception):
     pass
 
 
-class SegmentValidationError(Exception):
+class SegmentValidationError(DownloadError):
     """Raised when a downloaded segment fails size or integrity validation."""
     pass
+
+
+def is_strong_etag(etag: Optional[str]) -> bool:
+    """
+    Checks if an ETag is a strong validator according to RFC 7232/9110.
+    Weak ETags start with W/ or w/ and must not be used for sub-range requests with If-Range.
+    """
+    if not etag:
+        return False
+    val = etag.strip()
+    if val.startswith(('W/"', 'w/"', "W/'", "w/'")):
+        return False
+    return True
 
 
 def calculate_segments(
@@ -172,15 +185,15 @@ class SegmentedDownloader:
         self.active_connections: int = 0
         self.mode_description: str = "Segmented"
 
-    def cancel(self):
-        """Thread-safe cancellation of all segment downloads and active connections."""
-        self._is_cancelled = True
+        self.probed_etag: Optional[str] = None
+        self.probed_last_modified: Optional[str] = None
+        self._wire_bytes_received: int = 0
+        self._fatal_error: bool = False
+        self._fatal_exception: Optional[Exception] = None
+
+    def _abort_active_streams(self):
+        """Immediately closes all active HTTP responses and clients to unblock threads."""
         with self._lock:
-            if self._active_fallback_downloader is not None:
-                try:
-                    self._active_fallback_downloader.cancel()
-                except Exception:
-                    pass
             for resp in list(self._active_responses):
                 try:
                     resp.close()
@@ -191,12 +204,28 @@ class SegmentedDownloader:
                     client.close()
                 except Exception:
                     pass
+
+    def cancel(self):
+        """Thread-safe cancellation of all segment downloads and active connections."""
+        self._is_cancelled = True
+        with self._lock:
+            if self._active_fallback_downloader is not None:
+                try:
+                    self._active_fallback_downloader.cancel()
+                except Exception:
+                    pass
+        self._abort_active_streams()
         self._cleanup_parts()
 
     def _check_cancelled(self):
         if self._is_cancelled or self.is_cancelled_cb():
             self._cleanup_parts()
             raise DownloadCancelledError("Download cancelled by user.")
+
+    def _check_segment_aborted(self):
+        self._check_cancelled()
+        if self._fatal_error:
+            raise self._fatal_exception or DownloadError("Download aborted due to fatal error in a segment.")
 
     def _cleanup_parts(self):
         """Cleans up temporary segment files and temporary directories."""
@@ -369,22 +398,24 @@ class SegmentedDownloader:
                             # Range rejected or error
                             return False, None, detected_name, etag, last_modified
 
-                        # Server returned 206! Validate Content-Range header
+                        # Server returned 206! Strictly validate Content-Range header
                         content_range = response.headers.get("content-range", "").strip()
-                        # Format: "bytes 0-0/TOTAL"
-                        match = re.match(r"^bytes\s+(\d+)-(\d+)/(\d+|\*)$", content_range, re.IGNORECASE)
+                        # Strict format: "bytes 0-0/TOTAL"
+                        match = re.match(r"^bytes\s+(\d+)-(\d+)/(\d+)$", content_range, re.IGNORECASE)
                         if not match:
                             return False, None, detected_name, etag, last_modified
 
-                        start_b, end_b, total_b = match.groups()
-                        if start_b != "0":
+                        start_b = int(match.group(1))
+                        end_b = int(match.group(2))
+                        total_b = int(match.group(3))
+
+                        # Strict probe validation: start must be 0, end must be 0, total must be positive and > end_b
+                        if start_b != 0 or end_b != 0 or total_b <= 0 or total_b <= end_b:
                             return False, None, detected_name, etag, last_modified
 
-                        if total_b == "*":
-                            return False, None, detected_name, etag, last_modified
-
-                        total_size = int(total_b)
-                        return True, total_size, detected_name, etag, last_modified
+                        self.probed_etag = etag
+                        self.probed_last_modified = last_modified
+                        return True, total_b, detected_name, etag, last_modified
                 finally:
                     with self._lock:
                         if client in self._active_clients:
@@ -394,6 +425,9 @@ class SegmentedDownloader:
 
     def _fallback_to_single_connection(self, reason: str) -> Tuple[Path, int]:
         """Falls back gracefully to the Stage 2 single-connection engine."""
+        with self._lock:
+            self._fatal_error = False
+            self._fatal_exception = None
         self._check_cancelled()
         self.mode_description = reason
         self.active_connections = 1
@@ -444,18 +478,19 @@ class SegmentedDownloader:
             nonlocal last_speed_check_time, bytes_at_last_check, speed_samples
             now = time.time()
             with self._lock:
-                total_dl = sum(s.downloaded_bytes for s in self.segments)
+                wire_now = self._wire_bytes_received
+                total_dl = sum(min(s.expected_size, s.downloaded_bytes) for s in self.segments)
                 self.downloaded_bytes = total_dl
                 time_delta = now - last_speed_check_time
                 if time_delta >= 0.25:
-                    delta_b = total_dl - bytes_at_last_check
+                    delta_b = max(0, wire_now - bytes_at_last_check)
                     instant_speed = delta_b / time_delta
                     speed_samples.append(instant_speed)
                     if len(speed_samples) > 5:
                         speed_samples.pop(0)
                     self.speed = sum(speed_samples) / len(speed_samples)
                     last_speed_check_time = now
-                    bytes_at_last_check = total_dl
+                    bytes_at_last_check = wire_now
                     if self.total_bytes and self.speed > 0:
                         rem = max(0, self.total_bytes - total_dl)
                         self.eta = rem / self.speed
@@ -479,11 +514,19 @@ class SegmentedDownloader:
                 for segment in self.segments
             ]
 
-            # Wait for all segments to complete or fail
-            for future in as_completed(futures):
-                self._check_cancelled()
-                # May raise RangeNotSupportedError, DownloadError, or DownloadCancelledError
-                future.result()
+            try:
+                for future in as_completed(futures):
+                    self._check_cancelled()
+                    future.result()
+            except Exception as exc:
+                with self._lock:
+                    self._fatal_error = True
+                    if not self._fatal_exception:
+                        self._fatal_exception = exc
+                self._abort_active_streams()
+                for f in futures:
+                    f.cancel()
+                raise
 
         # All segments completed successfully! Now merge them.
         self._check_cancelled()
@@ -512,7 +555,7 @@ class SegmentedDownloader:
         last_error = ""
 
         while attempt < self.max_retries:
-            self._check_cancelled()
+            self._check_segment_aborted()
             attempt += 1
 
             # Check if this segment was already completed in a prior attempt
@@ -540,30 +583,62 @@ class SegmentedDownloader:
 
             except DownloadCancelledError:
                 segment.status = "Cancelled"
+                self.cancel()
                 raise
-            except RangeNotSupportedError:
+            except RangeNotSupportedError as rne:
                 segment.status = "Failed"
+                with self._lock:
+                    self._fatal_error = True
+                    self._fatal_exception = rne
+                self._abort_active_streams()
                 raise
+            except SegmentValidationError as sve:
+                segment.status = "Failed"
+                segment.error = str(sve)
+                if segment.part_file and segment.part_file.exists():
+                    try:
+                        segment.part_file.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                with self._lock:
+                    self._fatal_error = True
+                    self._fatal_exception = sve
+                self._abort_active_streams()
+                raise sve
             except Exception as exc:
-                self._check_cancelled()
+                self._check_segment_aborted()
 
                 if is_local_disk_error(exc):
                     segment.status = "Failed"
                     segment.error = f"Disk error: {exc}"
+                    with self._lock:
+                        self._fatal_error = True
+                        self._fatal_exception = exc
+                    self._abort_active_streams()
                     raise DownloadError(f"Disk error on segment {segment.index}: {exc}") from exc
 
                 is_retryable = False
                 if isinstance(exc, httpx.HTTPStatusError):
                     code = exc.response.status_code
                     if code == 200:
-                        # Server rejected Range request and sent 200 OK
-                        raise RangeNotSupportedError(f"Server returned 200 OK instead of 206 for segment {segment.index}")
+                        rne = RangeNotSupportedError(f"Server returned 200 OK instead of 206 for segment {segment.index}")
+                        segment.status = "Failed"
+                        with self._lock:
+                            self._fatal_error = True
+                            self._fatal_exception = rne
+                        self._abort_active_streams()
+                        raise rne
                     if code in RETRYABLE_STATUS_CODES:
                         is_retryable = True
                         last_error = f"HTTP {code}"
                     else:
                         segment.status = "Failed"
-                        raise DownloadError(f"Permanent HTTP error {code} on segment {segment.index}") from exc
+                        de = DownloadError(f"Permanent HTTP error {code} on segment {segment.index}")
+                        with self._lock:
+                            self._fatal_error = True
+                            self._fatal_exception = de
+                        self._abort_active_streams()
+                        raise de from exc
 
                 elif isinstance(exc, RETRYABLE_EXCEPTIONS):
                     is_retryable = True
@@ -573,12 +648,23 @@ class SegmentedDownloader:
 
                 segment.error = last_error
                 if is_retryable and attempt < self.max_retries:
+                    if segment.part_file and segment.part_file.exists():
+                        try:
+                            segment.part_file.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                    segment.downloaded_bytes = 0
                     time.sleep(min(attempt * 0.5, 2.0))
                 else:
                     segment.status = "Failed"
-                    raise DownloadError(
+                    de = DownloadError(
                         f"Segment {segment.index} failed after {self.max_retries} attempts: {last_error}"
                     )
+                    with self._lock:
+                        self._fatal_error = True
+                        self._fatal_exception = de
+                    self._abort_active_streams()
+                    raise de
 
     def _stream_segment_to_file(
         self,
@@ -595,11 +681,14 @@ class SegmentedDownloader:
             "Accept-Encoding": "identity",
         }
 
-        # Validator consistency with If-Range
-        if etag:
-            headers["If-Range"] = etag
-        elif last_modified:
-            headers["If-Range"] = last_modified
+        # Validator consistency with If-Range:
+        # RFC 7232/9110: Weak ETags must NOT be sent in If-Range for sub-range requests!
+        target_etag = self.probed_etag or etag
+        target_lm = self.probed_last_modified or last_modified
+        if is_strong_etag(target_etag):
+            headers["If-Range"] = target_etag.strip()
+        elif target_lm:
+            headers["If-Range"] = target_lm.strip()
 
         client_kwargs = {"follow_redirects": True, "timeout": self.timeout}
         if self.transport is not None:
@@ -613,7 +702,7 @@ class SegmentedDownloader:
                     with self._lock:
                         self._active_responses.append(response)
                     try:
-                        self._check_cancelled()
+                        self._check_segment_aborted()
 
                         if response.status_code == 200:
                             raise RangeNotSupportedError(
@@ -623,29 +712,68 @@ class SegmentedDownloader:
                         if response.status_code != 206:
                             response.raise_for_status()
 
-                        # Validate Content-Range header
-                        content_range = response.headers.get("content-range", "").strip()
-                        expected_prefix = f"bytes {segment.start_byte}-"
-                        if not content_range.lower().startswith(expected_prefix.lower()):
-                            raise SegmentValidationError(
-                                f"Invalid Content-Range '{content_range}' for segment {segment.index} (expected prefix '{expected_prefix}')"
+                        # Check validator consistency across segments
+                        resp_etag = response.headers.get("etag")
+                        if target_etag and resp_etag and resp_etag.strip() != target_etag.strip():
+                            raise RangeNotSupportedError(
+                                f"Validator mismatch on segment {segment.index}: ETag changed from '{target_etag}' to '{resp_etag}'. Resource was modified on server."
                             )
+
+                        resp_lm = response.headers.get("last-modified")
+                        if target_lm and resp_lm and resp_lm.strip() != target_lm.strip():
+                            raise RangeNotSupportedError(
+                                f"Validator mismatch on segment {segment.index}: Last-Modified changed from '{target_lm}' to '{resp_lm}'. Resource was modified on server."
+                            )
+
+                        # Validate Content-Range header strictly: bytes START-END/TOTAL
+                        content_range = response.headers.get("content-range", "").strip()
+                        match = re.match(r"^bytes\s+(\d+)-(\d+)/(\d+)$", content_range, re.IGNORECASE)
+                        if not match:
+                            raise SegmentValidationError(
+                                f"Malformed or missing Content-Range header '{content_range}' for segment {segment.index}"
+                            )
+
+                        start_b = int(match.group(1))
+                        end_b = int(match.group(2))
+                        total_b = int(match.group(3))
+
+                        if start_b != segment.start_byte or end_b != segment.end_byte:
+                            raise SegmentValidationError(
+                                f"Content-Range mismatch for segment {segment.index}: got bytes {start_b}-{end_b}, expected {segment.start_byte}-{segment.end_byte}"
+                            )
+
+                        if self.total_bytes is not None and total_b != self.total_bytes:
+                            raise SegmentValidationError(
+                                f"Content-Range total size mismatch for segment {segment.index}: got {total_b}, expected {self.total_bytes}"
+                            )
+
+                        # Content-Length check if header present
+                        cl_header = response.headers.get("content-length")
+                        if cl_header and cl_header.strip().isdigit():
+                            cl_val = int(cl_header.strip())
+                            if cl_val != segment.expected_size:
+                                raise SegmentValidationError(
+                                    f"Content-Length header mismatch for segment {segment.index}: got {cl_val}, expected {segment.expected_size}"
+                                )
 
                         # Write segment bytes to part file
                         segment.downloaded_bytes = 0
                         with open(segment.part_file, "wb") as f:
                             for chunk in response.iter_bytes(chunk_size=self.chunk_size):
-                                self._check_cancelled()
+                                self._check_segment_aborted()
                                 if not chunk:
                                     continue
                                 f.write(chunk)
-                                segment.downloaded_bytes += len(chunk)
+                                chunk_len = len(chunk)
+                                with self._lock:
+                                    self._wire_bytes_received += chunk_len
+                                segment.downloaded_bytes += chunk_len
                                 progress_callback()
 
                             f.flush()
                             os.fsync(f.fileno())
 
-                        # Validate size
+                        # Validate final written size
                         actual_size = segment.part_file.stat().st_size
                         if actual_size != segment.expected_size:
                             raise SegmentValidationError(

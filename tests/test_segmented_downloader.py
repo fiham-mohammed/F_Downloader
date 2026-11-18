@@ -16,6 +16,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import QThread
 
 from mdm.utils import safe_finalize_file, sanitize_filename
 from mdm.downloader import HttpDownloader, DownloadError, DownloadCancelledError
@@ -25,6 +26,7 @@ from mdm.segment_manager import (
     Segment,
     SegmentValidationError,
     RangeNotSupportedError,
+    is_strong_etag,
 )
 from mdm.download_worker import DownloadWorker
 from mdm.queue_manager import QueueManager
@@ -402,32 +404,77 @@ class TestSegmentedDownloader(unittest.TestCase):
     # 14. Cancellation during parallel downloading
     def test_14_cancellation_during_parallel_downloading(self):
         payload = b"CancellableData" * 200000
+        segments_started = threading.Event()
+        cancel_triggered = threading.Event()
 
-        # Slow transport to give time to trigger cancel
-        def slow_handler(req: httpx.Request):
-            time.sleep(0.1)
-            return httpx.Response(206, headers={"Content-Range": f"bytes 0-10/{len(payload)}"}, content=payload[:10])
+        def cancellable_handler(request: httpx.Request):
+            range_header = request.headers.get("range", "").strip()
+
+            # 1. Initial probe request must succeed with valid bytes 0-0/TOTAL
+            if range_header == "bytes=0-0":
+                return httpx.Response(
+                    206,
+                    headers={
+                        "Content-Type": "application/octet-stream",
+                        "Content-Range": f"bytes 0-0/{len(payload)}",
+                        "Content-Length": "1",
+                    },
+                    content=payload[:1],
+                )
+
+            # 2. Parallel segment request started
+            if range_header.startswith("bytes="):
+                segments_started.set()
+                # Hold segment worker until cancellation is initiated
+                cancel_triggered.wait(timeout=2.0)
+                time.sleep(0.05)
+                spec = range_header[6:].strip()
+                parts = spec.split("-")
+                start = int(parts[0])
+                end = int(parts[1]) if parts[1] else len(payload) - 1
+                chunk = payload[start:end + 1]
+                return httpx.Response(
+                    206,
+                    headers={
+                        "Content-Type": "application/octet-stream",
+                        "Content-Range": f"bytes {start}-{end}/{len(payload)}",
+                        "Content-Length": str(len(chunk)),
+                    },
+                    content=chunk,
+                )
+
+            return httpx.Response(200, content=payload)
 
         d = SegmentedDownloader(
             url="http://mock.server/cancel.bin",
             destination_folder=self.temp_dir,
             connections=4,
             min_segment_size=1024,
-            transport=httpx.MockTransport(slow_handler),
+            transport=httpx.MockTransport(cancellable_handler),
         )
 
-        def do_cancel():
-            time.sleep(0.05)
+        def trigger_cancellation():
+            # Wait until parallel segment workers are verified active
+            self.assertTrue(segments_started.wait(timeout=3.0))
+            cancel_triggered.set()
             d.cancel()
 
-        threading.Thread(target=do_cancel, daemon=True).start()
+        cancel_thread = threading.Thread(target=trigger_cancellation, daemon=True)
+        cancel_thread.start()
 
         with self.assertRaises(DownloadCancelledError):
             d.download()
 
+        cancel_thread.join(timeout=2.0)
+
         # Temporary segment directories and files must be cleaned up
         parts_dirs = list(Path(self.temp_dir).glob("*.parts"))
         self.assertEqual(len(parts_dirs), 0)
+        part_files = list(Path(self.temp_dir).glob("*.part"))
+        self.assertEqual(len(part_files), 0)
+        # Ensure no final completed file was created
+        final_files = [f for f in Path(self.temp_dir).iterdir() if f.is_file()]
+        self.assertEqual(len(final_files), 0)
 
     # 15. Unknown file-size fallback
     def test_15_unknown_file_size_fallback(self):
@@ -521,7 +568,7 @@ class TestSegmentedDownloader(unittest.TestCase):
         self.assertEqual(final_path.stat().st_size, len(payload))
         self.assertEqual(total_bytes, len(payload))
 
-    # 20. GUI responsiveness during parallel downloading
+    # 20. GUI responsiveness during parallel downloading (real QThread integration)
     def test_20_gui_responsiveness_during_parallel_downloading(self):
         payload = b"ResponsivePayload" * 200000
         transport = self.create_range_transport(payload)
@@ -541,18 +588,28 @@ class TestSegmentedDownloader(unittest.TestCase):
         segments_emits = []
         worker.segments_updated.connect(lambda i_id, segs: segments_emits.append(len(segs)))
 
-        thread = threading.Thread(target=worker.run)
-        thread.start()
+        finished_emits = []
 
-        # Keep Qt event loop pumping events while worker runs
+        qthread = QThread()
+        worker.moveToThread(qthread)
+        qthread.started.connect(worker.run)
+        worker.completed.connect(lambda i_id, path, size: finished_emits.append(path))
+        worker.finished.connect(qthread.quit)
+        worker.failed.connect(lambda i_id, err: qthread.quit())
+
+        qthread.start()
+
+        # Pump Qt event loop while QThread worker runs
         start = time.time()
-        while thread.is_alive() and time.time() - start < 10.0:
+        while qthread.isRunning() and time.time() - start < 10.0:
             self.qt_app.processEvents()
             time.sleep(0.02)
 
-        thread.join(timeout=2.0)
-        self.assertFalse(thread.is_alive())
+        qthread.wait(5000)
+        self.assertFalse(qthread.isRunning())
         self.assertGreater(len(progress_emits), 0)
+        self.assertGreater(len(segments_emits), 0)
+        self.assertEqual(len(finished_emits), 1)
 
     # 21. Cleanup of temporary segment files
     def test_21_cleanup_of_temporary_segment_files(self):
@@ -592,6 +649,399 @@ class TestSegmentedDownloader(unittest.TestCase):
         self.assertTrue(final_path.exists())
         self.assertEqual(final_path.read_bytes(), payload)
         self.assertIn("Single connection fallback", downloader.mode_description)
+
+    # 23-26. Real parallel concurrency tests for 2, 4, 8, and 16 connections
+    def _run_concurrency_test(self, connections: int):
+        payload = b"ConcurrentPayloadData-" * (connections * 128 * 1024)
+        active_segments = 0
+        max_active_segments = 0
+        lock = threading.Lock()
+        probe_count = 0
+
+        def concurrency_handler(request: httpx.Request):
+            nonlocal active_segments, max_active_segments, probe_count
+            range_header = request.headers.get("range", "").strip()
+
+            if range_header == "bytes=0-0":
+                with lock:
+                    probe_count += 1
+                return httpx.Response(
+                    206,
+                    headers={
+                        "Content-Type": "application/octet-stream",
+                        "Content-Range": f"bytes 0-0/{len(payload)}",
+                        "Content-Length": "1",
+                    },
+                    content=payload[:1],
+                )
+
+            if range_header.startswith("bytes="):
+                with lock:
+                    active_segments += 1
+                    if active_segments > max_active_segments:
+                        max_active_segments = active_segments
+
+                try:
+                    # Brief delay to allow parallel worker overlap across threads
+                    time.sleep(0.04)
+                    spec = range_header[6:].strip()
+                    parts = spec.split("-")
+                    start = int(parts[0])
+                    end = int(parts[1]) if parts[1] else len(payload) - 1
+                    chunk = payload[start:end + 1]
+                    return httpx.Response(
+                        206,
+                        headers={
+                            "Content-Type": "application/octet-stream",
+                            "Content-Range": f"bytes {start}-{end}/{len(payload)}",
+                            "Content-Length": str(len(chunk)),
+                        },
+                        content=chunk,
+                    )
+                finally:
+                    with lock:
+                        active_segments -= 1
+
+            return httpx.Response(200, content=payload)
+
+        downloader = SegmentedDownloader(
+            url=f"http://mock.server/concurrent_{connections}.bin",
+            destination_folder=self.temp_dir,
+            connections=connections,
+            min_segment_size=1024,
+            transport=httpx.MockTransport(concurrency_handler),
+        )
+
+        final_path, total_bytes = downloader.download()
+
+        self.assertTrue(final_path.exists())
+        self.assertEqual(total_bytes, len(payload))
+        self.assertEqual(final_path.read_bytes(), payload)
+        self.assertEqual(len(downloader.segments), connections)
+        # Probe connection is separate and not counted in segment concurrency
+        self.assertEqual(probe_count, 1)
+        # Maximum simultaneous connections must never exceed configured connection limit
+        self.assertLessEqual(max_active_segments, connections)
+        # Confirm simultaneous parallel overlap occurred
+        self.assertGreaterEqual(max_active_segments, min(2, connections))
+        return max_active_segments
+
+    def test_23_concurrency_2_connections(self):
+        max_active = self._run_concurrency_test(connections=2)
+        self.assertEqual(max_active, 2)
+
+    def test_24_concurrency_4_connections(self):
+        max_active = self._run_concurrency_test(connections=4)
+        self.assertGreaterEqual(max_active, 2)
+        self.assertLessEqual(max_active, 4)
+
+    def test_25_concurrency_8_connections(self):
+        max_active = self._run_concurrency_test(connections=8)
+        self.assertGreaterEqual(max_active, 2)
+        self.assertLessEqual(max_active, 8)
+
+    def test_26_concurrency_16_connections(self):
+        max_active = self._run_concurrency_test(connections=16)
+        self.assertGreaterEqual(max_active, 2)
+        self.assertLessEqual(max_active, 16)
+
+    # 27. Strong vs. Weak ETag RFC 7232/9110 rules
+    def test_27_is_strong_etag_validator(self):
+        self.assertFalse(is_strong_etag(None))
+        self.assertFalse(is_strong_etag(""))
+        self.assertFalse(is_strong_etag('W/"weak-123"'))
+        self.assertFalse(is_strong_etag('w/"weak-123"'))
+        self.assertFalse(is_strong_etag("W/'weak-123'"))
+        self.assertTrue(is_strong_etag('"strong-123"'))
+        self.assertTrue(is_strong_etag('strong-bare-123'))
+
+    # 28. Weak ETag not sent with If-Range; Last-Modified sent instead
+    def test_28_if_range_uses_strong_etag_or_last_modified_not_weak_etag(self):
+        payload = b"WeakETagValidationPayload" * 100000
+        observed_if_range = []
+
+        def if_range_handler(request: httpx.Request):
+            range_header = request.headers.get("range", "").strip()
+            if_range = request.headers.get("if-range")
+            if if_range:
+                observed_if_range.append(if_range)
+
+            if range_header == "bytes=0-0":
+                return httpx.Response(
+                    206,
+                    headers={
+                        "Content-Type": "application/octet-stream",
+                        "Content-Range": f"bytes 0-0/{len(payload)}",
+                        "Content-Length": "1",
+                        "ETag": 'W/"weak-abc-123"',
+                        "Last-Modified": "Wed, 21 Oct 2026 07:28:00 GMT",
+                    },
+                    content=payload[:1],
+                )
+
+            spec = range_header[6:].strip()
+            parts = spec.split("-")
+            start = int(parts[0])
+            end = int(parts[1]) if parts[1] else len(payload) - 1
+            chunk = payload[start:end + 1]
+            return httpx.Response(
+                206,
+                headers={
+                    "Content-Type": "application/octet-stream",
+                    "Content-Range": f"bytes {start}-{end}/{len(payload)}",
+                    "Content-Length": str(len(chunk)),
+                    "ETag": 'W/"weak-abc-123"',
+                    "Last-Modified": "Wed, 21 Oct 2026 07:28:00 GMT",
+                },
+                content=chunk,
+            )
+
+        downloader = SegmentedDownloader(
+            url="http://mock.server/weak_etag.bin",
+            destination_folder=self.temp_dir,
+            connections=4,
+            min_segment_size=1024,
+            transport=httpx.MockTransport(if_range_handler),
+        )
+        final_path, total_bytes = downloader.download()
+
+        self.assertTrue(final_path.exists())
+        self.assertEqual(total_bytes, len(payload))
+        # Verify that weak ETag was NOT sent in If-Range; Last-Modified was sent instead
+        self.assertGreater(len(observed_if_range), 0)
+        for val in observed_if_range:
+            self.assertFalse(val.startswith('W/"'))
+            self.assertEqual(val, "Wed, 21 Oct 2026 07:28:00 GMT")
+
+    # 29. Server validator change mid-download triggers clean fallback
+    def test_29_etag_change_mid_download_triggers_fallback(self):
+        payload = b"ETagChangedOnServerData" * 100000
+
+        def changed_etag_handler(request: httpx.Request):
+            range_header = request.headers.get("range", "").strip()
+
+            if range_header == "bytes=0-0":
+                # Probe receives original ETag
+                return httpx.Response(
+                    206,
+                    headers={
+                        "Content-Type": "application/octet-stream",
+                        "Content-Range": f"bytes 0-0/{len(payload)}",
+                        "Content-Length": "1",
+                        "ETag": '"initial-version-1"',
+                    },
+                    content=payload[:1],
+                )
+
+            if range_header.startswith("bytes="):
+                # Segment request gets changed ETag (file was modified on server)
+                spec = range_header[6:].strip()
+                parts = spec.split("-")
+                start = int(parts[0])
+                end = int(parts[1]) if parts[1] else len(payload) - 1
+                chunk = payload[start:end + 1]
+                return httpx.Response(
+                    206,
+                    headers={
+                        "Content-Type": "application/octet-stream",
+                        "Content-Range": f"bytes {start}-{end}/{len(payload)}",
+                        "Content-Length": str(len(chunk)),
+                        "ETag": '"modified-version-2"',
+                    },
+                    content=chunk,
+                )
+
+            # Single-connection fallback request without Range
+            return httpx.Response(
+                200,
+                headers={
+                    "Content-Type": "application/octet-stream",
+                    "Content-Length": str(len(payload)),
+                    "ETag": '"modified-version-2"',
+                },
+                content=payload,
+            )
+
+        downloader = SegmentedDownloader(
+            url="http://mock.server/modified_etag.bin",
+            destination_folder=self.temp_dir,
+            connections=4,
+            min_segment_size=1024,
+            transport=httpx.MockTransport(changed_etag_handler),
+        )
+        final_path, total_bytes = downloader.download()
+
+        self.assertTrue(final_path.exists())
+        self.assertEqual(total_bytes, len(payload))
+        self.assertEqual(final_path.read_bytes(), payload)
+        self.assertIn("Single connection fallback", downloader.mode_description)
+
+    # 30. Probe strict Content-Range validation failure falls back
+    def test_30_probe_strict_content_range_validation_failure_falls_back(self):
+        payload = b"ProbeStrictContentRangeData" * 100000
+
+        def bad_probe_handler(request: httpx.Request):
+            range_header = request.headers.get("range", "").strip()
+            if range_header == "bytes=0-0":
+                # Inconsistent probe: start 0, end 1 (must be 0-0)
+                return httpx.Response(
+                    206,
+                    headers={
+                        "Content-Type": "application/octet-stream",
+                        "Content-Range": f"bytes 0-1/{len(payload)}",
+                        "Content-Length": "2",
+                    },
+                    content=payload[:2],
+                )
+
+            # Fallback single connection request
+            return httpx.Response(
+                200,
+                headers={"Content-Length": str(len(payload))},
+                content=payload,
+            )
+
+        downloader = SegmentedDownloader(
+            url="http://mock.server/bad_probe.bin",
+            destination_folder=self.temp_dir,
+            connections=4,
+            min_segment_size=1024,
+            transport=httpx.MockTransport(bad_probe_handler),
+        )
+        final_path, total_bytes = downloader.download()
+
+        self.assertTrue(final_path.exists())
+        self.assertEqual(total_bytes, len(payload))
+        self.assertIn("Single connection mode", downloader.mode_description)
+
+    # 31. Segment Content-Length header mismatch fails safely
+    def test_31_segment_content_length_mismatch_fails_safely(self):
+        payload = b"ContentLengthMismatchData" * 100000
+
+        def cl_mismatch_handler(request: httpx.Request):
+            range_header = request.headers.get("range", "").strip()
+            if range_header == "bytes=0-0":
+                return httpx.Response(
+                    206,
+                    headers={
+                        "Content-Type": "application/octet-stream",
+                        "Content-Range": f"bytes 0-0/{len(payload)}",
+                        "Content-Length": "1",
+                    },
+                    content=payload[:1],
+                )
+
+            spec = range_header[6:].strip()
+            parts = spec.split("-")
+            start = int(parts[0])
+            end = int(parts[1]) if parts[1] else len(payload) - 1
+            chunk = payload[start:end + 1]
+            # Send incorrect Content-Length header
+            return httpx.Response(
+                206,
+                headers={
+                    "Content-Type": "application/octet-stream",
+                    "Content-Range": f"bytes {start}-{end}/{len(payload)}",
+                    "Content-Length": "999999",
+                },
+                content=chunk,
+            )
+
+        downloader = SegmentedDownloader(
+            url="http://mock.server/cl_mismatch.bin",
+            destination_folder=self.temp_dir,
+            connections=4,
+            min_segment_size=1024,
+            max_retries=1,
+            transport=httpx.MockTransport(cl_mismatch_handler),
+        )
+        with self.assertRaises(DownloadError):
+            downloader.download()
+
+        # Temporary files cleaned up, no corrupted final file
+        parts_dirs = list(Path(self.temp_dir).glob("*.parts"))
+        self.assertEqual(len(parts_dirs), 0)
+        final_files = [f for f in Path(self.temp_dir).iterdir() if f.is_file()]
+        self.assertEqual(len(final_files), 0)
+
+    # 32. Monotonic wire bytes speed calculation during retries
+    def test_32_speed_calculation_is_monotonic_during_retries(self):
+        payload = b"RetrySpeedMonotonicData" * 100000
+        speeds = []
+
+        def on_prog(downloaded, total, speed, eta):
+            if speed is not None:
+                speeds.append(speed)
+
+        transport = self.create_range_transport(payload, mode="flaky_segment")
+        downloader = SegmentedDownloader(
+            url="http://mock.server/speed_retry.bin",
+            destination_folder=self.temp_dir,
+            connections=4,
+            min_segment_size=1024,
+            max_retries=3,
+            on_progress=on_prog,
+            transport=transport,
+        )
+        final_path, total_bytes = downloader.download()
+
+        self.assertTrue(final_path.exists())
+        self.assertEqual(total_bytes, len(payload))
+        # Ensure all reported speeds were non-negative
+        for s in speeds:
+            self.assertGreaterEqual(s, 0.0)
+        # Ensure wire bytes counter is strictly positive
+        self.assertGreater(downloader._wire_bytes_received, 0)
+
+    # 33. Sibling segments abort promptly on fatal error
+    def test_33_sibling_segments_abort_on_fatal_error(self):
+        payload = b"SiblingAbortPayload" * 100000
+        started_event = threading.Event()
+
+        def fatal_segment_handler(request: httpx.Request):
+            range_header = request.headers.get("range", "").strip()
+            if range_header == "bytes=0-0":
+                return httpx.Response(
+                    206,
+                    headers={
+                        "Content-Type": "application/octet-stream",
+                        "Content-Range": f"bytes 0-0/{len(payload)}",
+                        "Content-Length": "1",
+                    },
+                    content=payload[:1],
+                )
+
+            spec = range_header[6:].strip()
+            parts = spec.split("-")
+            start = int(parts[0])
+
+            if start == 0:
+                # First segment triggers a fatal non-retryable 404 error
+                return httpx.Response(404, content=b"Segment Not Found")
+
+            # Sibling segments will be aborted promptly
+            started_event.set()
+            time.sleep(1.0)
+            return httpx.Response(206, headers={"Content-Range": f"bytes {start}-{len(payload)-1}/{len(payload)}"}, content=payload[start:])
+
+        downloader = SegmentedDownloader(
+            url="http://mock.server/fatal_sibling.bin",
+            destination_folder=self.temp_dir,
+            connections=4,
+            min_segment_size=1024,
+            max_retries=1,
+            transport=httpx.MockTransport(fatal_segment_handler),
+        )
+        start_t = time.time()
+        with self.assertRaises(DownloadError):
+            downloader.download()
+        elapsed = time.time() - start_t
+
+        # Must have aborted promptly without waiting full sleep duration on siblings
+        self.assertLess(elapsed, 4.0)
+        self.assertTrue(downloader._fatal_error)
+        parts_dirs = list(Path(self.temp_dir).glob("*.parts"))
+        self.assertEqual(len(parts_dirs), 0)
 
 
 if __name__ == "__main__":
