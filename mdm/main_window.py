@@ -1,6 +1,7 @@
 import os
 import subprocess
 from datetime import datetime
+from typing import Optional, Dict, Any, List
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -15,6 +16,8 @@ from PySide6.QtWidgets import (
 )
 
 from mdm.queue_manager import QueueManager
+from mdm.database import DatabaseManager
+from mdm.models import DownloadStatus
 from mdm.utils import sanitize_filename, extract_filename_from_url, format_bytes
 from mdm.settings import get_default_connections, set_default_connections, VALID_CONNECTION_COUNTS
 
@@ -273,6 +276,10 @@ class SegmentDetailsDialog(QDialog):
             item.setForeground(QColor("#4c8dff"))
         elif status.startswith("Retrying"):
             item.setForeground(QColor("#f6993f"))
+        elif status == "Paused":
+            item.setForeground(QColor("#f59e0b"))
+        elif status == "Interrupted":
+            item.setForeground(QColor("#a855f7"))
         elif status == "Failed":
             item.setForeground(QColor("#e3342f"))
         else:
@@ -387,13 +394,14 @@ class AddDownloadDialog(QDialog):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, db: Optional[DatabaseManager] = None):
         super().__init__()
         self.setWindowTitle("My Download Manager")
         self.resize(1260, 820)
         self.setMinimumSize(1020, 680)
 
-        self.queue_mgr = QueueManager(self)
+        self.db = db
+        self.queue_mgr = QueueManager(self, db=self.db)
         self.current_filter = "All Downloads"
         self.nav_buttons = {}
         self._item_row_map = {}  # item_id -> row
@@ -427,7 +435,12 @@ class MainWindow(QMainWindow):
         # Connect QueueManager signals
         self.queue_mgr.item_added.connect(self._on_item_added)
         self.queue_mgr.item_updated.connect(self._on_item_updated)
+        self.queue_mgr.download_paused.connect(self._on_item_updated)
         self.queue_mgr.metrics_changed.connect(self._on_metrics_changed)
+
+        # Initial render of persistent items and metrics
+        self.refresh_table()
+        self.queue_mgr.emit_metrics()
 
     def build_sidebar(self):
         sidebar = QFrame()
@@ -468,7 +481,7 @@ class MainWindow(QMainWindow):
                 layout.addWidget(button)
 
         layout.addStretch()
-        version = QLabel("MY DOWNLOAD MANAGER\nStage 3 • Multi-Connection Engine")
+        version = QLabel("MY DOWNLOAD MANAGER\nStage 4 • Persistence & Recovery")
         version.setObjectName("Muted")
         version.setStyleSheet("font-size: 8pt;")
         layout.addWidget(version)
@@ -557,6 +570,18 @@ class MainWindow(QMainWindow):
         self.btn_start_queue.clicked.connect(self.queue_mgr.start_all)
         table_header.addWidget(self.btn_start_queue)
 
+        self.btn_pause = QPushButton("⏸  Pause Active")
+        self.btn_pause.setCursor(Qt.PointingHandCursor)
+        self.btn_pause.setToolTip("Pause the active download safely (preserves partial data)")
+        self.btn_pause.clicked.connect(self.queue_mgr.pause_active)
+        table_header.addWidget(self.btn_pause)
+
+        self.btn_resume = QPushButton("▶  Resume")
+        self.btn_resume.setCursor(Qt.PointingHandCursor)
+        self.btn_resume.setToolTip("Resume the selected download or first paused/interrupted download")
+        self.btn_resume.clicked.connect(self._on_resume_clicked)
+        table_header.addWidget(self.btn_resume)
+
         self.btn_cancel = QPushButton("⏹  Cancel Active")
         self.btn_cancel.setObjectName("DangerButton")
         self.btn_cancel.setCursor(Qt.PointingHandCursor)
@@ -596,7 +621,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(panel, 1)
 
         footer = QLabel(
-            "Stage 3 Engine: Advanced multi-connection downloading with HTTP Range requests, dynamic segment merging, and stream safety."
+            "Stage 4 Engine: Advanced multi-connection downloading with Pause, Resume, SQLite persistence, and crash recovery."
         )
         footer.setObjectName("Muted")
         footer.setWordWrap(True)
@@ -662,23 +687,24 @@ class MainWindow(QMainWindow):
         conn_layout.addWidget(conn_hint)
         layout.addWidget(conn_box)
 
-        # Stage 3 Information Panel
+        # Stage 4 Information Panel
         info = QFrame()
         info.setObjectName("Panel")
         info_layout = QVBoxLayout(info)
         info_layout.setContentsMargins(20, 20, 20, 20)
-        info_layout.addWidget(QLabel("My Download Manager — Stage 3: Multi-Connection Engine"))
+        info_layout.addWidget(QLabel("My Download Manager — Stage 4: Persistence & Recovery"))
 
         description = QLabel(
-            "Stage 3 adds an advanced multi-connection download engine inspired by IDM.\n\n"
+            "Stage 4 implements robust SQLite persistence, download pause and resume, crash recovery, "
+            "and multi-connection restart capabilities.\n\n"
             "Key capabilities:\n"
-            "• HTTP Range capability detection with automatic single-connection fallback.\n"
-            "• Exact non-overlapping segment calculations and parallel ThreadPoolExecutor streaming.\n"
-            "• Real-time segment progress tracking, active connections counter, and segment-details view.\n"
-            "• Per-segment independent retries for transient server/network errors.\n"
-            "• Safe byte-ordered segment concatenation and final exact size and boundary verification.\n"
-            "• Safe no-overwrite finalisation and automatic temporary file cleanup.\n\n"
-            "Upcoming stages will introduce SQLite history persistence, pause/resume, and browser extensions."
+            "• SQLite database storage for download history, settings, and segmented progress.\n"
+            "• Pause and resume downloads (both single-connection and multi-connection modes).\n"
+            "• Application restart recovery: resume interrupted downloads from where they stopped.\n"
+            "• Reusable .parts directory and segment state preservation across sessions.\n"
+            "• ETag, Last-Modified, and Content-Range validator consistency.\n"
+            "• Graceful shutdown with automatic download interruption and partial file preservation.\n"
+            "• Safe file finalisation and clean cancellation cleanup."
         )
         description.setObjectName("Muted")
         description.setWordWrap(True)
@@ -802,6 +828,8 @@ class MainWindow(QMainWindow):
             "Completed": QColor("#38c172"),
             "Failed": QColor("#e3342f"),
             "Cancelled": QColor("#91a0b7"),
+            "Paused": QColor("#f59e0b"),
+            "Interrupted": QColor("#a855f7"),
         }
         if status.startswith("Retrying"):
             item.setForeground(QColor("#f6993f"))
@@ -831,7 +859,7 @@ class MainWindow(QMainWindow):
                 continue
             if selected == "Completed" and item["status"] != "Completed":
                 continue
-            if selected == "Queue" and item["status"] != "Queued":
+            if selected == "Queue" and item["status"] not in ("Queued", "Paused", "Interrupted"):
                 continue
             if selected in category_extensions:
                 if Path(name).suffix.lower() not in category_extensions[selected]:
@@ -876,7 +904,7 @@ class MainWindow(QMainWindow):
             pval = item.get("progress_value", 0)
             if pval == -1:
                 pbar.setRange(0, 0)
-                pbar.setFormat("Downloading…")
+                pbar.setFormat(item.get("progress", "Downloading…"))
             else:
                 pbar.setRange(0, 100)
                 pbar.setValue(pval)
@@ -893,6 +921,20 @@ class MainWindow(QMainWindow):
             self.table.setItem(row, 6, QTableWidgetItem(item.get("added", "")))
 
         self.list_hint.setText(f"{len(rows)} item(s) shown")
+
+    def _on_resume_clicked(self):
+        """Resumes selected download item or first paused/interrupted download in queue."""
+        selected_rows = self.table.selectionModel().selectedRows() if self.table.selectionModel() else []
+        if selected_rows:
+            row = selected_rows[0].row()
+            for item_id, r in self._item_row_map.items():
+                if r == row:
+                    self.queue_mgr.resume_download(item_id)
+                    return
+        for item in self.queue_mgr.items:
+            if item["status"] in ("Paused", "Interrupted", "Failed"):
+                self.queue_mgr.resume_download(item["id"])
+                return
 
     def show_context_menu(self, pos):
         item = self.table.itemAt(pos)
@@ -916,13 +958,26 @@ class MainWindow(QMainWindow):
         menu = QMenu(self)
         status = download_item["status"]
 
-        if status in ("Queued", "Failed", "Cancelled"):
-            action_start = menu.addAction("▶  Start Download")
-            action_start.triggered.connect(lambda: self.queue_mgr.start_item(item_id))
-
-        if status in ("Downloading", "Queued") or status.startswith("Retrying"):
+        if status == "Downloading" or status.startswith("Retrying"):
+            action_pause = menu.addAction("⏸  Pause Download")
+            action_pause.triggered.connect(lambda: self.queue_mgr.pause_download(item_id))
             action_cancel = menu.addAction("⏹  Cancel Download")
             action_cancel.triggered.connect(lambda: self.queue_mgr.cancel_download(item_id))
+        elif status in ("Paused", "Interrupted"):
+            action_resume = menu.addAction("▶  Resume Download")
+            action_resume.triggered.connect(lambda: self.queue_mgr.resume_download(item_id))
+            action_cancel = menu.addAction("⏹  Cancel Download")
+            action_cancel.triggered.connect(lambda: self.queue_mgr.cancel_download(item_id))
+        elif status == "Queued":
+            action_start = menu.addAction("▶  Start Download")
+            action_start.triggered.connect(lambda: self.queue_mgr.start_item(item_id))
+            action_pause = menu.addAction("⏸  Pause")
+            action_pause.triggered.connect(lambda: self.queue_mgr.pause_download(item_id))
+            action_cancel = menu.addAction("⏹  Cancel Download")
+            action_cancel.triggered.connect(lambda: self.queue_mgr.cancel_download(item_id))
+        elif status in ("Failed", "Cancelled"):
+            action_retry = menu.addAction("🔄  Retry / Resume")
+            action_retry.triggered.connect(lambda: self.queue_mgr.resume_download(item_id))
 
         menu.addSeparator()
 
@@ -940,8 +995,11 @@ class MainWindow(QMainWindow):
         action_copy.triggered.connect(lambda: QGuiApplication.clipboard().setText(download_item["url"]))
 
         menu.addSeparator()
-        action_remove = menu.addAction("🗑  Remove from List")
-        action_remove.triggered.connect(lambda: self._remove_item(item_id))
+        action_remove = menu.addAction("🗑  Remove from History")
+        action_remove.triggered.connect(lambda: self._remove_item(item_id, delete_file=False))
+
+        action_delete = menu.addAction("🗑  Delete from Disk & History")
+        action_delete.triggered.connect(lambda: self._remove_item(item_id, delete_file=True))
 
         menu.exec(self.table.viewport().mapToGlobal(pos))
 
@@ -965,8 +1023,8 @@ class MainWindow(QMainWindow):
         else:
             QMessageBox.information(self, "File Not Found", f"File does not exist:\n{path}")
 
-    def _remove_item(self, item_id: str):
-        self.queue_mgr.remove_item(item_id)
+    def _remove_item(self, item_id: str, delete_file: bool = False):
+        self.queue_mgr.remove_item(item_id, delete_file=delete_file)
         self.refresh_table()
 
     def _on_table_double_clicked(self, index):

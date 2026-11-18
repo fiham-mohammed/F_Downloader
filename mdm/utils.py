@@ -233,3 +233,17 @@ def format_eta(seconds: float | None) -> str:
         return f"{hrs:02d}:{mins:02d}:{rem_secs:02d}"
     return f"{mins:02d}:{rem_secs:02d}"
 
+
+def is_strong_etag(etag: str | None) -> bool:
+    """
+    Checks if an ETag is a strong validator according to RFC 7232/9110.
+    Weak ETags start with W/ or w/ and must not be used for sub-range requests with If-Range.
+    """
+    if not etag:
+        return False
+    val = etag.strip()
+    if val.startswith(('W/"', 'w/"', "W/'", "w/'")):
+        return False
+    return True
+
+
