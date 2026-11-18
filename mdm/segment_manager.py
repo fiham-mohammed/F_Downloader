@@ -4,12 +4,15 @@ import time
 import errno
 import shutil
 import uuid
+import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional, Tuple, List, Dict, Any
 import httpx
+
+logger = logging.getLogger("mdm.segment_manager")
 
 from mdm.utils import (
     sanitize_filename,
@@ -21,6 +24,7 @@ from mdm.downloader import (
     HttpDownloader,
     DownloadError,
     DownloadCancelledError,
+    DownloadPausedError,
     RETRYABLE_STATUS_CODES,
     RETRYABLE_EXCEPTIONS,
     is_local_disk_error,
@@ -99,6 +103,7 @@ class Segment:
     status: str = "Queued"  # "Queued", "Downloading", "Completed", "Failed", "Retrying"
     part_file: Optional[Path] = None
     error: str = ""
+    retry_count: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
         pct = (self.downloaded_bytes / self.expected_size * 100.0) if self.expected_size > 0 else 0.0
@@ -112,6 +117,8 @@ class Segment:
             "progress_value": int(round(min(100.0, pct))),
             "status": self.status,
             "error": self.error,
+            "temp_path": str(self.part_file) if self.part_file else "",
+            "retry_count": self.retry_count,
         }
 
 
@@ -142,11 +149,18 @@ class SegmentedDownloader:
         timeout_seconds: float = 20.0,
         min_segment_size: Optional[int] = None,
         is_cancelled: Optional[Callable[[], bool]] = None,
+        is_paused: Optional[Callable[[], bool]] = None,
+        etag: Optional[str] = None,
+        last_modified: Optional[str] = None,
+        resumed_parts_dir: Optional[str | Path] = None,
+        resumed_segments: Optional[List[Any]] = None,
         on_progress: Optional[Callable[[int, Optional[int], float, Optional[float]], None]] = None,
         on_filename_detected: Optional[Callable[[str], None]] = None,
         on_retry: Optional[Callable[[int, int, str], None]] = None,
         on_segments_updated: Optional[Callable[[List[Dict[str, Any]]], None]] = None,
         on_connection_status: Optional[Callable[[int, int, str], None]] = None,
+        on_db_persist: Optional[Callable[..., None]] = None,
+        on_metadata_detected: Optional[Callable[[Optional[str], Optional[str], str, str, Optional[int], bool], None]] = None,
         transport: Optional[httpx.BaseTransport] = None,
     ):
         self.url = url.strip()
@@ -160,20 +174,30 @@ class SegmentedDownloader:
         self.transport = transport
 
         self.is_cancelled_cb = is_cancelled or (lambda: False)
+        self.is_paused_cb = is_paused or (lambda: False)
+        self.persisted_etag = etag
+        self.persisted_last_modified = last_modified
+        self.probed_etag = etag
+        self.probed_last_modified = last_modified
+        self.resumed_parts_dir = Path(resumed_parts_dir) if resumed_parts_dir else None
+        self.resumed_segments = resumed_segments
         self.on_progress_cb = on_progress
         self.on_filename_detected_cb = on_filename_detected
         self.on_retry_cb = on_retry
         self.on_segments_updated_cb = on_segments_updated
         self.on_connection_status_cb = on_connection_status
+        self.on_db_persist_cb = on_db_persist
+        self.on_metadata_detected_cb = on_metadata_detected
 
         self._is_cancelled = False
+        self._is_paused = False
         self._lock = threading.Lock()
         self._active_clients: List[httpx.Client] = []
         self._active_responses: List[httpx.Response] = []
         self._active_fallback_downloader: Optional[HttpDownloader] = None
 
         self.segments: List[Segment] = []
-        self.parts_dir: Optional[Path] = None
+        self.parts_dir: Optional[Path] = self.resumed_parts_dir
         self.merged_part_path: Optional[Path] = None
         self.final_path: Optional[Path] = None
 
@@ -185,8 +209,6 @@ class SegmentedDownloader:
         self.active_connections: int = 0
         self.mode_description: str = "Segmented"
 
-        self.probed_etag: Optional[str] = None
-        self.probed_last_modified: Optional[str] = None
         self._wire_bytes_received: int = 0
         self._fatal_error: bool = False
         self._fatal_exception: Optional[Exception] = None
@@ -205,6 +227,18 @@ class SegmentedDownloader:
                 except Exception:
                     pass
 
+    def pause(self):
+        """Thread-safe request to pause active download and preserve segment files."""
+        self._is_paused = True
+        with self._lock:
+            if self._active_fallback_downloader is not None:
+                try:
+                    self._active_fallback_downloader.pause()
+                except Exception:
+                    pass
+        self._abort_active_streams()
+        # Do NOT call _cleanup_parts() on pause!
+
     def cancel(self):
         """Thread-safe cancellation of all segment downloads and active connections."""
         self._is_cancelled = True
@@ -218,6 +252,8 @@ class SegmentedDownloader:
         self._cleanup_parts()
 
     def _check_cancelled(self):
+        if self._is_paused or self.is_paused_cb():
+            raise DownloadPausedError("Download paused by user.")
         if self._is_cancelled or self.is_cancelled_cb():
             self._cleanup_parts()
             raise DownloadCancelledError("Download cancelled by user.")
@@ -301,36 +337,135 @@ class SegmentedDownloader:
                 f"Single connection mode (File size {total_size} bytes below {self.min_segment_size} bytes threshold)"
             )
 
-        # 2. Segment calculation
-        raw_segments = calculate_segments(total_size, self.requested_connections, self.min_segment_size)
-        if len(raw_segments) <= 1:
-            return self._fallback_to_single_connection("Single connection mode (1 segment calculated)")
+        # 2. Segment calculation / Resume setup
+        is_resuming = False
+        if self.resumed_parts_dir and self.resumed_parts_dir.exists() and self.resumed_segments:
+            # Check validator consistency between probed and persisted
+            etag_match = True
+            if self.probed_etag and self.persisted_etag and self.probed_etag.strip() != self.persisted_etag.strip():
+                etag_match = False
+            lm_match = True
+            if self.probed_last_modified and self.persisted_last_modified and self.probed_last_modified.strip() != self.persisted_last_modified.strip():
+                lm_match = False
 
-        self.total_bytes = total_size
-        self.mode_description = f"Multi-connection ({len(raw_segments)} connections)"
-        self._emit_connection_status()
+            if not etag_match or not lm_match:
+                # Server resource changed! Delete old parts and restart from byte 0
+                shutil.rmtree(self.resumed_parts_dir, ignore_errors=True)
+                is_resuming = False
+            else:
+                is_resuming = True
 
-        # 3. Setup temporary working directory for segments
-        safe_name = sanitize_filename(self.effective_filename or extract_filename_from_url(self.url, "download"))
-        unique_token = uuid.uuid4().hex[:8]
-        self.parts_dir = self.destination_folder / f".{safe_name}_{unique_token}.parts"
-        self.parts_dir.mkdir(parents=True, exist_ok=True)
+        if is_resuming:
+            self.parts_dir = self.resumed_parts_dir
+            self.total_bytes = total_size
+            self.mode_description = f"Multi-connection ({len(self.resumed_segments)} connections)"
+            self._emit_connection_status()
 
-        self.segments = [
-            Segment(
-                index=i,
-                start_byte=start,
-                end_byte=end,
-                expected_size=(end - start + 1),
-                part_file=self.parts_dir / f"segment_{i:02d}.part",
-            )
-            for i, (start, end) in enumerate(raw_segments)
-        ]
-        self._emit_segments()
+            self.segments = []
+            for s in self.resumed_segments:
+                if hasattr(s, "segment_index"):
+                    idx = s.segment_index
+                    start = s.start_byte
+                    end = s.end_byte
+                    exp_sz = s.expected_size
+                    s_part = getattr(s, "temp_path", None)
+                    s_retries = getattr(s, "retry_count", 0)
+                elif isinstance(s, dict):
+                    idx = s.get("index", s.get("segment_index", 0))
+                    start = s["start"] if "start" in s else s["start_byte"]
+                    end = s["end"] if "end" in s else s["end_byte"]
+                    exp_sz = end - start + 1
+                    s_part = s.get("temp_path")
+                    s_retries = s.get("retry_count", 0)
+                else:
+                    continue
+
+                part_file = Path(s_part) if s_part else (self.parts_dir / f"segment_{idx:02d}.part")
+                actual_sz = part_file.stat().st_size if part_file.exists() else 0
+                if actual_sz == exp_sz:
+                    status = "Completed"
+                    dl_bytes = exp_sz
+                elif 0 < actual_sz < exp_sz:
+                    status = "Queued"
+                    dl_bytes = actual_sz
+                elif actual_sz > exp_sz:
+                    part_file.unlink(missing_ok=True)
+                    status = "Queued"
+                    dl_bytes = 0
+                else:
+                    status = "Queued"
+                    dl_bytes = 0
+
+                self.segments.append(
+                    Segment(
+                        index=idx,
+                        start_byte=start,
+                        end_byte=end,
+                        expected_size=exp_sz,
+                        downloaded_bytes=dl_bytes,
+                        status=status,
+                        part_file=part_file,
+                        retry_count=s_retries,
+                    )
+                )
+            self.downloaded_bytes = sum(seg.downloaded_bytes for seg in self.segments)
+            self._emit_segments()
+            if self.on_progress_cb:
+                self.on_progress_cb(self.downloaded_bytes, self.total_bytes, 0.0, None)
+            if self.on_metadata_detected_cb:
+                self.on_metadata_detected_cb(
+                    etag,
+                    last_modified,
+                    self.effective_filename,
+                    str(self.parts_dir),
+                    self.total_bytes,
+                    True,
+                )
+        else:
+            raw_segments = calculate_segments(total_size, self.requested_connections, self.min_segment_size)
+            if len(raw_segments) <= 1:
+                return self._fallback_to_single_connection("Single connection mode (1 segment calculated)")
+
+            self.total_bytes = total_size
+            self.mode_description = f"Multi-connection ({len(raw_segments)} connections)"
+            self._emit_connection_status()
+
+            # 3. Setup temporary working directory for segments
+            if self.resumed_parts_dir:
+                self.parts_dir = self.resumed_parts_dir
+            else:
+                safe_name = sanitize_filename(self.effective_filename or extract_filename_from_url(self.url, "download"))
+                unique_token = uuid.uuid4().hex[:8]
+                self.parts_dir = self.destination_folder / f".{safe_name}_{unique_token}.parts"
+            self.parts_dir.mkdir(parents=True, exist_ok=True)
+
+            self.segments = [
+                Segment(
+                    index=i,
+                    start_byte=start,
+                    end_byte=end,
+                    expected_size=(end - start + 1),
+                    part_file=self.parts_dir / f"segment_{i:02d}.part",
+                )
+                for i, (start, end) in enumerate(raw_segments)
+            ]
+            self._emit_segments()
+            if self.on_metadata_detected_cb:
+                self.on_metadata_detected_cb(
+                    etag,
+                    last_modified,
+                    self.effective_filename,
+                    str(self.parts_dir),
+                    self.total_bytes,
+                    True,
+                )
 
         # 4. Execute parallel segment download with graceful fallback if server fails on ranges
         try:
             return self._download_segments_parallel(etag, last_modified)
+        except DownloadPausedError:
+            # Do NOT clean up parts on pause!
+            raise
         except RangeNotSupportedError as rne:
             # Server accepted initial probe but rejected subsequent range requests: fallback cleanly
             self._cleanup_parts()
@@ -441,9 +576,14 @@ class SegmentedDownloader:
             chunk_size=self.chunk_size,
             timeout_seconds=self.timeout.read or 20.0,
             is_cancelled=self.is_cancelled_cb,
+            is_paused=self.is_paused_cb,
+            etag=self.probed_etag or self.persisted_etag,
+            last_modified=self.probed_last_modified or self.persisted_last_modified,
             on_progress=self.on_progress_cb,
             on_filename_detected=self.on_filename_detected_cb,
             on_retry=self.on_retry_cb,
+            on_metadata_detected=self.on_metadata_detected_cb,
+            on_db_persist=self.on_db_persist_cb,
             transport=self.transport,
         )
 
@@ -471,11 +611,12 @@ class SegmentedDownloader:
         num_workers = len(self.segments)
         start_time = time.time()
         last_speed_check_time = start_time
+        last_db_persist_time = start_time
         bytes_at_last_check = 0
         speed_samples = []
 
         def update_progress():
-            nonlocal last_speed_check_time, bytes_at_last_check, speed_samples
+            nonlocal last_speed_check_time, last_db_persist_time, bytes_at_last_check, speed_samples
             now = time.time()
             with self._lock:
                 wire_now = self._wire_bytes_received
@@ -501,6 +642,13 @@ class SegmentedDownloader:
                 self.on_progress_cb(total_dl, self.total_bytes, self.speed, self.eta)
             self._emit_segments()
             self._emit_connection_status()
+
+            if self.on_db_persist_cb and (now - last_db_persist_time >= 1.5):
+                try:
+                    self.on_db_persist_cb(total_dl, self.speed, self.eta)
+                except Exception as exc:
+                    logger.warning("Error in segment manager DB persist callback: %s", exc)
+                last_db_persist_time = now
 
         with ThreadPoolExecutor(max_workers=num_workers) as executor:
             futures = [
@@ -569,6 +717,8 @@ class SegmentedDownloader:
                 except OSError:
                     pass
 
+            if attempt > 1:
+                segment.retry_count = attempt - 1
             segment.status = f"Retrying ({attempt}/{self.max_retries})" if attempt > 1 else "Downloading"
             self._emit_segments()
             self._emit_connection_status()
@@ -581,6 +731,9 @@ class SegmentedDownloader:
                 progress_callback()
                 return
 
+            except DownloadPausedError:
+                segment.status = "Paused"
+                raise
             except DownloadCancelledError:
                 segment.status = "Cancelled"
                 self.cancel()
@@ -673,10 +826,28 @@ class SegmentedDownloader:
         last_modified: Optional[str],
         progress_callback: Callable[[], None],
     ):
-        """Streams a single segment range into its dedicated part file."""
+        """Streams a single segment range into its dedicated part file, resuming from existing offset if present."""
+        current_offset = 0
+        open_mode = "wb"
+        if segment.part_file and segment.part_file.exists():
+            try:
+                sz = segment.part_file.stat().st_size
+                if sz == segment.expected_size:
+                    segment.status = "Completed"
+                    segment.downloaded_bytes = segment.expected_size
+                    return
+                elif 0 < sz < segment.expected_size:
+                    current_offset = sz
+                    open_mode = "ab"
+                elif sz > segment.expected_size:
+                    segment.part_file.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+        stream_start = segment.start_byte + current_offset
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) MyDownloadManager/3.0",
-            "Range": f"bytes={segment.start_byte}-{segment.end_byte}",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) MyDownloadManager/4.0",
+            "Range": f"bytes={stream_start}-{segment.end_byte}",
             "Accept": "*/*",
             "Accept-Encoding": "identity",
         }
@@ -737,9 +908,9 @@ class SegmentedDownloader:
                         end_b = int(match.group(2))
                         total_b = int(match.group(3))
 
-                        if start_b != segment.start_byte or end_b != segment.end_byte:
+                        if start_b != stream_start or end_b != segment.end_byte:
                             raise SegmentValidationError(
-                                f"Content-Range mismatch for segment {segment.index}: got bytes {start_b}-{end_b}, expected {segment.start_byte}-{segment.end_byte}"
+                                f"Content-Range mismatch for segment {segment.index}: got bytes {start_b}-{end_b}, expected {stream_start}-{segment.end_byte}"
                             )
 
                         if self.total_bytes is not None and total_b != self.total_bytes:
@@ -748,17 +919,18 @@ class SegmentedDownloader:
                             )
 
                         # Content-Length check if header present
+                        expected_stream_len = segment.end_byte - stream_start + 1
                         cl_header = response.headers.get("content-length")
                         if cl_header and cl_header.strip().isdigit():
                             cl_val = int(cl_header.strip())
-                            if cl_val != segment.expected_size:
+                            if cl_val != expected_stream_len:
                                 raise SegmentValidationError(
-                                    f"Content-Length header mismatch for segment {segment.index}: got {cl_val}, expected {segment.expected_size}"
+                                    f"Content-Length header mismatch for segment {segment.index}: got {cl_val}, expected {expected_stream_len}"
                                 )
 
                         # Write segment bytes to part file
-                        segment.downloaded_bytes = 0
-                        with open(segment.part_file, "wb") as f:
+                        segment.downloaded_bytes = current_offset
+                        with open(segment.part_file, open_mode) as f:
                             for chunk in response.iter_bytes(chunk_size=self.chunk_size):
                                 self._check_segment_aborted()
                                 if not chunk:

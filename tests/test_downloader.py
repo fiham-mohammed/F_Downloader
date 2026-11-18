@@ -1,5 +1,6 @@
 import os
 import sys
+import re
 import time
 import errno
 import shutil
@@ -420,11 +421,12 @@ class TestDownloaderEngine(unittest.TestCase):
 
         # Confirm thread has cleanly exited and not destroyed while running
         self.assertFalse(win.queue_mgr.is_busy())
-        self.assertEqual(item["status"], "Cancelled")
+        # In Stage 4, shutdown preserves partial download and sets status to Interrupted
+        self.assertEqual(item["status"], "Interrupted")
 
-        # Confirm incomplete .part files are cleaned up
+        # Confirm incomplete .part file is preserved for recovery
         part_files = list(Path(self.temp_dir).glob("*.part"))
-        self.assertEqual(len(part_files), 0, "No .part files should remain after graceful shutdown.")
+        self.assertGreater(len(part_files), 0, "Partial .part file must be preserved after graceful shutdown for recovery.")
 
     # 17. Regression Test: Disk permission error (must fail immediately without retrying)
     def test_17_disk_permission_error_no_retry(self):
@@ -743,6 +745,83 @@ class TestDownloaderEngine(unittest.TestCase):
         self.assertEqual(format_eta(-1), "—")
         self.assertEqual(format_eta(90), "01:30")
         self.assertEqual(format_eta(3661), "01:01:01")
+
+    # 27. Stage 4 Regression Test: Segmented download shutdown preserves .parts directory and segment files
+    def test_27_segmented_shutdown_preserves_parts(self):
+        from mdm.main_window import MainWindow
+        win = MainWindow()
+
+        # Mock server supporting ranges with a multi-megabyte payload
+        payload = b"0123456789ABCDEF" * 150000  # 2,400,000 bytes
+        file_size = len(payload)
+
+        def range_handler(request: httpx.Request):
+            range_header = request.headers.get("range", "").strip()
+            if range_header == "bytes=0-0":
+                return httpx.Response(
+                    206,
+                    headers={
+                        "Content-Range": f"bytes 0-0/{file_size}",
+                        "Content-Length": "1",
+                        "Accept-Ranges": "bytes",
+                        "ETag": '"test-etag-123"',
+                    },
+                    content=payload[:1],
+                )
+            elif range_header.startswith("bytes="):
+                m = re.match(r"bytes=(\d+)-(\d+)", range_header)
+                if m:
+                    s_b = int(m.group(1))
+                    e_b = int(m.group(2))
+                    chunk = payload[s_b:e_b + 1]
+                    return httpx.Response(
+                        206,
+                        headers={
+                            "Content-Range": f"bytes {s_b}-{e_b}/{file_size}",
+                            "Content-Length": str(len(chunk)),
+                            "ETag": '"test-etag-123"',
+                        },
+                        stream=MockStream([chunk[i:i + 8192] for i in range(0, len(chunk), 8192)], delay=0.02),
+                    )
+            return httpx.Response(200, headers={"Content-Length": str(file_size)}, content=payload)
+
+        transport = httpx.MockTransport(range_handler)
+        item = win.queue_mgr.add_download(
+            "http://mock.server/large-segmented.iso",
+            self.temp_dir,
+            connections=4,
+            min_segment_size=500000,
+            auto_start=True,
+            transport=transport,
+        )
+
+        # Wait until download has started receiving segments and .parts dir is created
+        start_wait = time.time()
+        while time.time() - start_wait < 5.0:
+            self.qt_app.processEvents()
+            time.sleep(0.02)
+            parts_dirs = [p for p in Path(self.temp_dir).iterdir() if p.is_dir() and p.name.endswith(".parts")]
+            if parts_dirs and list(parts_dirs[0].glob("*.part")):
+                break
+
+        parts_dirs_before = [p for p in Path(self.temp_dir).iterdir() if p.is_dir() and p.name.endswith(".parts")]
+        self.assertGreater(len(parts_dirs_before), 0, ".parts directory should be created during active segmented download")
+        self.assertEqual(item["status"], "Downloading")
+        self.assertTrue(win.queue_mgr.is_busy())
+
+        # Trigger graceful shutdown / close
+        win.close()
+
+        # Confirm thread has stopped cleanly
+        self.assertFalse(win.queue_mgr.is_busy())
+        self.assertEqual(item["status"], "Interrupted")
+
+        # Confirm .parts directory and segment files remain intact on disk
+        parts_dirs = [p for p in Path(self.temp_dir).iterdir() if p.is_dir() and p.name.endswith(".parts")]
+        self.assertGreater(len(parts_dirs), 0, "The .parts directory must be preserved on shutdown for recovery.")
+        parts_dir = parts_dirs[0]
+        seg_files = list(parts_dir.glob("*.part"))
+        self.assertGreater(len(seg_files), 0, "Segment part files must remain inside the .parts directory.")
 
 
 if __name__ == "__main__":
