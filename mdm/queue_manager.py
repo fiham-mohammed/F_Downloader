@@ -383,8 +383,15 @@ class QueueManager(QObject):
         individual_speed_limit: Optional[int] = None,
         max_retry_attempts: Optional[int] = None,
         retry_enabled: bool = True,
+        browser_request: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Adds a new download item to the queue and persists it to database."""
+        """Adds a new download item to the queue and persists it to database.
+
+        ``browser_request`` (Stage 6A) is an optional idempotency record that is
+        committed atomically with the download row. If persisting fails (for
+        example a duplicate request_id), the exception propagates and the item
+        is NOT added to the in-memory queue.
+        """
         item_id = uuid.uuid4().hex[:8]
 
         user_explicit = explicit_filename if explicit_filename is not None else suggested_filename
@@ -472,7 +479,16 @@ class QueueManager(QObject):
                 max_retry_attempts=retries_allowed,
                 retry_enabled=1 if retry_enabled else 0,
             )
-            self.db.add_download(dl_model)
+            if browser_request is not None:
+                try:
+                    self.db.add_download(dl_model, browser_request=browser_request)
+                except Exception:
+                    # Nothing was committed: undo the in-memory limiter entry too.
+                    if ind_limit > 0:
+                        self.bandwidth_controller.remove_individual_limit(item_id)
+                    raise
+            else:
+                self.db.add_download(dl_model)
 
         self.items.append(item)
         self.item_added.emit(item)

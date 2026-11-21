@@ -7,6 +7,8 @@ import httpx
 from pathlib import Path
 from typing import Callable, Optional, Tuple, Any
 
+from mdm.browser_integration.request_validator import redact_url
+
 logger = logging.getLogger("mdm.downloader")
 
 from mdm.utils import (
@@ -423,7 +425,7 @@ class HttpDownloader:
                         if restart_required:
                             logger.warning(
                                 "Resume validation failed for %s. Discarding stale partial data and restarting from byte 0.",
-                                self.url,
+                                redact_url(self.url),  # never log signed query parameters
                             )
                             # Close 206 response, delete stale partial file, make fresh GET from byte zero
                             response_ctx.__exit__(None, None, None)

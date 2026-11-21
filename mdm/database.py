@@ -15,7 +15,11 @@ except Exception:
     DEFAULT_DATA_DIR = Path.home() / ".local" / "share" / "MyDownloadManager"
 
 DEFAULT_DB_FILE = DEFAULT_DATA_DIR / "downloads.db"
-CURRENT_SCHEMA_VERSION = 2
+CURRENT_SCHEMA_VERSION = 3  # v3 (Stage 6A): browser_requests idempotency table
+
+# Stage 6A: browser request idempotency retention policy.
+BROWSER_REQUEST_RETENTION_DAYS = 30
+BROWSER_REQUEST_MAX_ROWS = 10_000
 
 
 from mdm.models import DownloadModel, SegmentModel, DownloadStatus, can_transition
@@ -179,10 +183,93 @@ class DatabaseManager:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_downloads_category ON downloads(category);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_downloads_schedule ON downloads(schedule_enabled, scheduled_start_at);")
 
+        if from_version < 3 and to_version >= 3:
+            # Migration to Stage 6A schema (version 3): durable browser request
+            # idempotency. Purely additive - existing tables and rows are untouched.
+            # Only a SHA-256 fingerprint of the URL is stored, never the URL itself
+            # (signed URLs can carry access tokens in their query string).
+            # No foreign key: the record must outlive a download the user removes,
+            # so a replayed request_id is still recognised.
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS browser_requests (
+                    request_id  TEXT PRIMARY KEY,
+                    download_id TEXT,
+                    browser     TEXT NOT NULL,
+                    url_sha256  TEXT NOT NULL,
+                    status      TEXT NOT NULL,
+                    created_at  TEXT NOT NULL
+                );
+            """)
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_browser_requests_created ON browser_requests(created_at);"
+            )
+
+    # --- Browser request idempotency (Stage 6A) ---
+
+    @staticmethod
+    def _insert_browser_request(cur: sqlite3.Cursor, download_id: str, record: Dict[str, Any]):
+        """Plain INSERT (no OR REPLACE): a duplicate request_id raises
+        sqlite3.IntegrityError, which rolls back the enclosing transaction."""
+        cur.execute(
+            """
+            INSERT INTO browser_requests (request_id, download_id, browser, url_sha256, status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?);
+            """,
+            (
+                record["request_id"],
+                download_id,
+                record["browser"],
+                record["url_sha256"],
+                record.get("status", "accepted"),
+                record.get("created_at") or datetime.now().isoformat(),
+            ),
+        )
+
+    def get_browser_request(self, request_id: str) -> Optional[Dict[str, Any]]:
+        conn = self.get_connection()
+        row = conn.execute(
+            "SELECT request_id, download_id, browser, url_sha256, status, created_at "
+            "FROM browser_requests WHERE request_id = ?;",
+            (request_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def purge_browser_requests(
+        self,
+        max_age_days: int = BROWSER_REQUEST_RETENTION_DAYS,
+        max_rows: int = BROWSER_REQUEST_MAX_ROWS,
+        now: Optional[datetime] = None,
+    ) -> int:
+        """Retention policy: drops idempotency records older than ``max_age_days``
+        and keeps at most ``max_rows`` newest records. Download rows are never touched.
+        Returns the number of records removed."""
+        from datetime import timedelta
+        cutoff = ((now or datetime.now()) - timedelta(days=max_age_days)).isoformat()
+        with self._write_lock:
+            conn = self.get_connection()
+            with conn:
+                removed = conn.execute(
+                    "DELETE FROM browser_requests WHERE created_at < ?;", (cutoff,)
+                ).rowcount
+                removed += conn.execute(
+                    """
+                    DELETE FROM browser_requests WHERE request_id NOT IN (
+                        SELECT request_id FROM browser_requests ORDER BY created_at DESC LIMIT ?
+                    );
+                    """,
+                    (max_rows,),
+                ).rowcount
+        return removed
+
     # --- Downloads CRUD ---
 
-    def add_download(self, d: DownloadModel) -> bool:
-        """Inserts a new download record and optional initial segments."""
+    def add_download(self, d: DownloadModel, browser_request: Optional[Dict[str, Any]] = None) -> bool:
+        """Inserts a new download record and optional initial segments.
+
+        Stage 6A: when ``browser_request`` is given, its idempotency record is
+        inserted in the SAME transaction. Either both rows are committed or
+        neither is (e.g. a duplicate request_id raises sqlite3.IntegrityError
+        and the download row is rolled back)."""
         with self._write_lock:
             conn = self.get_connection()
             with conn:
@@ -239,6 +326,9 @@ class DatabaseManager:
                                 s.downloaded_bytes, s.status, s.temp_path, s.retry_count
                             ),
                         )
+
+                if browser_request is not None:
+                    self._insert_browser_request(cur, d.id, browser_request)
             return True
 
     def get_download(self, download_id: str) -> Optional[DownloadModel]:

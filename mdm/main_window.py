@@ -5,7 +5,7 @@ from typing import Optional, Dict, Any, List
 from pathlib import Path
 from urllib.parse import urlparse
 
-from PySide6.QtCore import Qt, QUrl, Slot, QCoreApplication, QDateTime
+from PySide6.QtCore import Qt, QUrl, Slot, QCoreApplication, QDateTime, QTimer
 from PySide6.QtGui import QColor, QDesktopServices, QGuiApplication
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QFrame, QLabel, QPushButton, QLineEdit,
@@ -429,6 +429,12 @@ class DownloadDetailsDialog(QDialog):
         form.addRow("Downloaded:", QLabel(format_bytes(item.get("downloaded_bytes", 0))))
         form.addRow("Category:", QLabel(item.get("category", "Other")))
         form.addRow("Priority:", QLabel(item.get("priority", "Normal")))
+        if item.get("source_label"):
+            form.addRow("Source:", QLabel(str(item["source_label"])))
+        if item.get("page_title"):
+            form.addRow("Page Title:", QLabel(str(item["page_title"])))
+        if item.get("referrer"):
+            form.addRow("Referrer:", QLabel(str(item["referrer"])))
 
         lim = item.get("individual_speed_limit", 0)
         lim_str = f"{lim // 1024} KB/s" if lim > 0 else "Unlimited"
@@ -597,6 +603,7 @@ class MainWindow(QMainWindow):
         elif self.queue_mgr.db:
             app_settings.bind_database(self.queue_mgr.db)
         self.current_filter = "All Downloads"
+        self.browser_integration = None  # Stage 6A, attached by app.py
         self.nav_buttons = {}
         self._item_row_map = {}  # item_id -> row
 
@@ -702,6 +709,13 @@ class MainWindow(QMainWindow):
         self.top_title.setStyleSheet("font-size: 15pt; font-weight: 650;")
         layout.addWidget(self.top_title)
         layout.addStretch()
+
+        # Stage 6A: browser integration indicator (hidden until a service is attached)
+        self.browser_status_label = QLabel("")
+        self.browser_status_label.setObjectName("Muted")
+        self.browser_status_label.setVisible(False)
+        layout.addWidget(self.browser_status_label)
+        layout.addSpacing(14)
 
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("Search downloads…")
@@ -1056,6 +1070,52 @@ class MainWindow(QMainWindow):
 
     def _on_item_added(self, item):
         self.refresh_table()
+
+    # ------------------------------------------------------------------
+    # Stage 6A: browser integration
+    # ------------------------------------------------------------------
+    def attach_browser_integration(self, service) -> None:
+        """Attaches a started/startable BrowserIntegrationService to this window.
+
+        The service adds downloads through ``self.queue_mgr`` only; this window
+        just reflects status and owns the service's shutdown.
+        """
+        self.browser_integration = service
+        service.download_received.connect(self._on_browser_download_received)
+        self.update_browser_status()
+
+    def update_browser_status(self) -> None:
+        service = self.browser_integration
+        if service is None:
+            self.browser_status_label.setVisible(False)
+            return
+        if service.is_running:
+            self.browser_status_label.setText("●  Browser integration ready")
+            self.browser_status_label.setStyleSheet("color: #4ade80;")
+        else:
+            self.browser_status_label.setText("●  Browser integration unavailable")
+            self.browser_status_label.setStyleSheet("color: #f59e0b;")
+        self.browser_status_label.setVisible(True)
+
+    def _on_browser_download_received(self, item: dict) -> None:
+        source = item.get("source_label") or "browser"
+        self.browser_status_label.setText(f"⇩  Added from {source}: {item.get('filename', '')}"[:80])
+        self.browser_status_label.setStyleSheet("color: #60a5fa;")
+        self.browser_status_label.setVisible(True)
+        QTimer.singleShot(6000, self, self.update_browser_status)
+
+    def bring_to_front(self) -> None:
+        """Shows and focuses the main window (requested from the browser popup)."""
+        if self.isMinimized():
+            self.showNormal()
+        else:
+            self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def _stop_browser_integration(self) -> None:
+        if self.browser_integration is not None:
+            self.browser_integration.stop()
 
     def _on_item_updated(self, item_id: str):
         # Update specific row directly if present in current view
@@ -1471,6 +1531,10 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         """Clean up active threads gracefully on window close."""
+        # Stage 6A: stop accepting browser requests before the queue shuts down.
+        browser_was_running = bool(self.browser_integration and self.browser_integration.is_running)
+        self._stop_browser_integration()
+
         if self.queue_mgr.is_busy():
             self.setEnabled(False)
             self.top_title.setText("Closing… Cancelling active downloads")
@@ -1500,6 +1564,10 @@ class MainWindow(QMainWindow):
                     "The active download worker has not stopped yet.\n\n"
                     "Please wait a moment and try closing the application again.",
                 )
+                if browser_was_running:
+                    # The application stays open, so browser integration resumes.
+                    self.browser_integration.start()
+                    self.update_browser_status()
                 event.ignore()
                 return
         else:

@@ -1,0 +1,4 @@
+# Build-time only. The native host itself uses the Python standard library
+# exclusively and has no third-party runtime dependencies.
+# This is NOT required to run My Download Manager (see ../requirements.txt).
+pyinstaller>=6.10
