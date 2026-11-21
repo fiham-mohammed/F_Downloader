@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>My Download Manager – Browser Integration</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body class="doc">
+  <main>
+    <header class="brand">
+      <img class="brand-logo" src="icons/icon48.png" alt="" width="40" height="40">
+      <div class="brand-text">
+        <h1>Browser integration setup</h1>
+        <p class="muted">Connect this extension to the My Download Manager desktop application.</p>
+      </div>
+    </header>
+
+    <section class="card">
+      <h2>This extension's ID</h2>
+      <p>Your extension ID: <code id="ext-id" class="ext-id">…</code></p>
+      <p class="muted small">You need this ID when registering the native messaging host.</p>
+    </section>
+
+    <section class="card">
+      <h2>1. Build the native host (once)</h2>
+      <p>In PowerShell, from the project folder:</p>
+      <pre>powershell -ExecutionPolicy Bypass -File .\native_host\build_host.ps1</pre>
+    </section>
+
+    <section class="card">
+      <h2>2. Register the native host</h2>
+      <p>Google Chrome:</p>
+      <pre id="cmd-chrome">powershell -ExecutionPolicy Bypass -File .\native_host\install_native_host.ps1 -ChromeExtensionId &lt;ID&gt;</pre>
+      <p style="margin-top:10px">Microsoft Edge:</p>
+      <pre id="cmd-edge">powershell -ExecutionPolicy Bypass -File .\native_host\install_native_host.ps1 -EdgeExtensionId &lt;ID&gt;</pre>
+      <p class="muted small" style="margin-top:8px">Both IDs can be given in one command. No administrator rights are needed.</p>
+    </section>
+
+    <section class="card">
+      <h2>3. Restart the browser and start the application</h2>
+      <ol>
+        <li>Close every window of the browser and open it again.</li>
+        <li>Start My Download Manager. The top bar shows <em>Browser integration ready</em>.</li>
+        <li>Right-click any HTTP or HTTPS download link and choose <strong>Download with My Download Manager</strong>.</li>
+      </ol>
+    </section>
+
+    <section class="card">
+      <h2>Troubleshooting</h2>
+      <ul>
+        <li><strong>Native host unavailable</strong> – the host is not registered, or was registered for a different extension ID. Re-run the install command with the ID shown above, then restart the browser.</li>
+        <li><strong>Application not running</strong> – start My Download Manager. Requests that could not be delivered stay in the popup so you can retry them.</li>
+        <li><strong>Connection error</strong> – check that <code>MyDownloadManagerNativeHost.exe</code> still exists where it was installed. The host log is at <code>%LOCALAPPDATA%\MyDownloadManager\logs\native_host.log</code>.</li>
+        <li>Only HTTP and HTTPS links are supported. Cookies and logins are not shared with the application, so links that need you to be signed in may fail.</li>
+      </ul>
+    </section>
+  </main>
+  <script src="instructions.js"></script>
+</body>
+</html>

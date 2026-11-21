@@ -1,0 +1,34 @@
+{
+  "manifest_version": 3,
+  "name": "My Download Manager",
+  "short_name": "MDM",
+  "version": "0.6.0",
+  "description": "Send HTTP and HTTPS download links from Chrome or Microsoft Edge to the My Download Manager desktop app.",
+  "minimum_chrome_version": "116",
+  "permissions": [
+    "contextMenus",
+    "nativeMessaging",
+    "storage",
+    "notifications"
+  ],
+  "background": {
+    "service_worker": "service_worker.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "My Download Manager",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

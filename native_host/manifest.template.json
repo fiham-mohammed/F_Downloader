@@ -1,0 +1,10 @@
+{
+  "name": "com.mydownloadmanager.native",
+  "description": "My Download Manager Native Messaging Host",
+  "path": "ABSOLUTE_PATH_TO_HOST_EXE",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://CHROME_EXTENSION_ID/",
+    "chrome-extension://EDGE_EXTENSION_ID/"
+  ]
+}

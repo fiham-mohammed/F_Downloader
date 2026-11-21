@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>My Download Manager</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body class="popup">
+  <header class="brand">
+    <img class="brand-logo" src="icons/icon48.png" alt="" width="36" height="36">
+    <div class="brand-text">
+      <h1>My Download Manager</h1>
+      <p class="muted">Browser integration</p>
+    </div>
+  </header>
+
+  <!-- A. Connection status -->
+  <section class="card status-card" aria-live="polite">
+    <div class="status-row">
+      <span id="status-dot" class="dot dot-checking" aria-hidden="true"></span>
+      <div class="status-text">
+        <strong id="status-label">Checking connection…</strong>
+        <span id="status-detail" class="muted small"></span>
+      </div>
+      <button id="retry-btn" class="btn btn-ghost btn-sm" type="button" title="Retry connection">Retry</button>
+    </div>
+  </section>
+
+  <!-- B. Add download -->
+  <section class="card">
+    <h2>Add download</h2>
+    <form id="add-form" novalidate>
+      <label for="url-input" class="sr-only">Download link</label>
+      <input id="url-input" class="input" type="url" inputmode="url" autocomplete="off" spellcheck="false"
+             placeholder="https://example.com/file.zip" maxlength="32768" required>
+      <button id="add-btn" class="btn btn-primary btn-block" type="submit">Add Download</button>
+    </form>
+    <p id="add-message" class="message" role="status" hidden></p>
+  </section>
+
+  <!-- Requests that could not be delivered (kept so nothing is silently discarded) -->
+  <section id="pending-card" class="card" hidden>
+    <h2>Not delivered yet</h2>
+    <ul id="pending-list" class="pending-list"></ul>
+  </section>
+
+  <!-- C. Application information -->
+  <section class="card">
+    <h2>Information</h2>
+    <dl class="info-grid">
+      <dt>Application</dt><dd>My Download Manager</dd>
+      <dt>Browser</dt><dd id="info-browser">—</dd>
+      <dt>Connection</dt><dd id="info-status">—</dd>
+      <dt>Version</dt><dd id="info-version">—</dd>
+    </dl>
+  </section>
+
+  <!-- D. Actions -->
+  <section class="actions">
+    <button id="open-app-btn" class="btn btn-secondary" type="button" disabled>Open My Download Manager</button>
+    <button id="help-btn" class="btn btn-ghost" type="button">Integration instructions</button>
+  </section>
+
+  <script type="module" src="popup.js"></script>
+</body>
+</html>

@@ -6,3 +6,24 @@ dist/
 *.spec
 .pytest_cache/
 MyDownloadManager_Stage4.zip
+
+# Generated release archives
+MyDownloadManager_Stage*.zip
+
+# Runtime databases and logs
+*.db
+*.sqlite
+*.sqlite3
+*.log
+
+# Temporary download files
+*.part
+*.tmp
+
+# Environment secrets
+.env
+.env.*
+
+# Native host generated files
+native_host/build/
+native_host/dist/
