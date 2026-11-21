@@ -1,6 +1,7 @@
 import os
 import re
 import errno
+from typing import Optional, Any, Union
 from pathlib import Path
 from urllib.parse import urlparse, unquote, unquote_to_bytes
 import urllib.parse
@@ -245,5 +246,44 @@ def is_strong_etag(etag: str | None) -> bool:
     if val.startswith(('W/"', 'w/"', "W/'", "w/'")):
         return False
     return True
+
+
+def parse_retry_after(value_or_msg: Any) -> float | None:
+    """
+    Parses Retry-After header or string containing Retry-After.
+    Supports both delta seconds (e.g. 120, '30 seconds', '45s') and HTTP-date formats.
+    """
+    if not value_or_msg:
+        return None
+    val_str = str(value_or_msg).strip()
+
+    # If it's an error message containing "retry-after: ...", extract the token
+    m = re.search(r"retry-after[:\s]+([^\r\n;)]+)", val_str, re.IGNORECASE)
+    candidate = m.group(1).strip() if m else val_str
+
+    # 1. Delta seconds (e.g. "120", "30 seconds", "45s")
+    sec_match = re.search(r"^\s*(\d+(?:\.\d+)?)(?:\s*(?:s|sec|seconds)?)?\s*$", candidate, re.IGNORECASE)
+    if sec_match:
+        try:
+            val = float(sec_match.group(1))
+            if val >= 0:
+                return val
+        except ValueError:
+            pass
+
+    # 2. HTTP-date format (e.g. "Wed, 21 Oct 2026 07:28:00 GMT")
+    try:
+        import email.utils
+        from datetime import datetime
+        dt = email.utils.parsedate_to_datetime(candidate)
+        if dt:
+            now = datetime.now(dt.tzinfo) if dt.tzinfo else datetime.now()
+            delay = (dt - now).total_seconds()
+            return max(0.0, delay)
+    except Exception:
+        pass
+
+    return None
+
 
 

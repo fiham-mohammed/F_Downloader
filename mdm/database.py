@@ -15,7 +15,7 @@ except Exception:
     DEFAULT_DATA_DIR = Path.home() / ".local" / "share" / "MyDownloadManager"
 
 DEFAULT_DB_FILE = DEFAULT_DATA_DIR / "downloads.db"
-CURRENT_SCHEMA_VERSION = 1
+CURRENT_SCHEMA_VERSION = 2
 
 
 from mdm.models import DownloadModel, SegmentModel, DownloadStatus, can_transition
@@ -91,6 +91,7 @@ class DatabaseManager:
 
                 if version == 0:
                     self._create_schema_v1(conn)
+                    self._migrate(conn, 1, CURRENT_SCHEMA_VERSION)
                     conn.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION};")
                 elif version < CURRENT_SCHEMA_VERSION:
                     self._migrate(conn, version, CURRENT_SCHEMA_VERSION)
@@ -151,7 +152,32 @@ class DatabaseManager:
 
     def _migrate(self, conn: sqlite3.Connection, from_version: int, to_version: int):
         """Handles sequential schema migrations."""
-        pass  # Version 1 is current baseline
+        if from_version < 2 and to_version >= 2:
+            # Migration to Stage 5 schema (version 2)
+            cur = conn.cursor()
+            cur.execute("PRAGMA table_info(downloads);")
+            existing_cols = {row["name"] for row in cur.fetchall()}
+
+            columns_to_add = [
+                ("priority", "TEXT DEFAULT 'Normal'"),
+                ("scheduled_start_at", "TEXT DEFAULT NULL"),
+                ("scheduled_stop_at", "TEXT DEFAULT NULL"),
+                ("schedule_enabled", "INTEGER DEFAULT 0"),
+                ("individual_speed_limit", "INTEGER DEFAULT 0"),
+                ("category", "TEXT DEFAULT 'Other'"),
+                ("retry_count", "INTEGER DEFAULT 0"),
+                ("max_retry_attempts", "INTEGER DEFAULT 3"),
+                ("next_retry_at", "TEXT DEFAULT NULL"),
+                ("retry_enabled", "INTEGER DEFAULT 1"),
+            ]
+
+            for col_name, col_def in columns_to_add:
+                if col_name not in existing_cols:
+                    conn.execute(f"ALTER TABLE downloads ADD COLUMN {col_name} {col_def};")
+
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_downloads_priority ON downloads(priority);")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_downloads_category ON downloads(category);")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_downloads_schedule ON downloads(schedule_enabled, scheduled_start_at);")
 
     # --- Downloads CRUD ---
 
@@ -173,9 +199,11 @@ class DatabaseManager:
                         status, download_mode, connection_count, total_size,
                         downloaded_size, speed, eta, created_at, started_at,
                         paused_at, completed_at, failed_at, error_message,
-                        etag, last_modified, supports_range, queue_order
+                        etag, last_modified, supports_range, queue_order,
+                        priority, scheduled_start_at, scheduled_stop_at, schedule_enabled,
+                        individual_speed_limit, category, retry_count, max_retry_attempts, next_retry_at, retry_enabled
                     ) VALUES (
-                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                     );
                     """,
                     (
@@ -183,7 +211,17 @@ class DatabaseManager:
                         d.status, d.download_mode, d.connection_count, d.total_size,
                         d.downloaded_size, d.speed, d.eta, d.created_at, d.started_at,
                         d.paused_at, d.completed_at, d.failed_at, d.error_message,
-                        d.etag, d.last_modified, d.supports_range, d.queue_order
+                        d.etag, d.last_modified, d.supports_range, d.queue_order,
+                        getattr(d, "priority", "Normal"),
+                        getattr(d, "scheduled_start_at", None),
+                        getattr(d, "scheduled_stop_at", None),
+                        getattr(d, "schedule_enabled", 0),
+                        getattr(d, "individual_speed_limit", 0),
+                        getattr(d, "category", "Other"),
+                        getattr(d, "retry_count", 0) or 0,
+                        getattr(d, "max_retry_attempts", 3),
+                        getattr(d, "next_retry_at", None),
+                        getattr(d, "retry_enabled", 1),
                     ),
                 )
 
@@ -231,6 +269,7 @@ class DatabaseManager:
 
     def _row_to_download_model(self, row: sqlite3.Row) -> DownloadModel:
         final_p = str(Path(row["destination_path"]) / row["filename"]) if (row["destination_path"] and row["filename"]) else None
+        keys = row.keys()
         return DownloadModel(
             id=row["id"],
             url=row["url"],
@@ -257,6 +296,16 @@ class DatabaseManager:
             last_modified=row["last_modified"],
             supports_range=row["supports_range"],
             queue_order=row["queue_order"] or 0,
+            priority=row["priority"] if "priority" in keys and row["priority"] else "Normal",
+            scheduled_start_at=row["scheduled_start_at"] if "scheduled_start_at" in keys else None,
+            scheduled_stop_at=row["scheduled_stop_at"] if "scheduled_stop_at" in keys else None,
+            schedule_enabled=row["schedule_enabled"] if "schedule_enabled" in keys and row["schedule_enabled"] is not None else 0,
+            individual_speed_limit=row["individual_speed_limit"] if "individual_speed_limit" in keys and row["individual_speed_limit"] is not None else 0,
+            category=row["category"] if "category" in keys and row["category"] else "Other",
+            retry_count=row["retry_count"] if "retry_count" in keys and row["retry_count"] is not None else 0,
+            max_retry_attempts=row["max_retry_attempts"] if "max_retry_attempts" in keys and row["max_retry_attempts"] is not None else 3,
+            next_retry_at=row["next_retry_at"] if "next_retry_at" in keys else None,
+            retry_enabled=row["retry_enabled"] if "retry_enabled" in keys and row["retry_enabled"] is not None else 1,
         )
 
     def update_download_status(
@@ -379,8 +428,20 @@ class DatabaseManager:
         total_size: Optional[int] = None,
         download_mode: Optional[str] = None,
         connection_count: Optional[int] = None,
+        priority: Optional[str] = None,
+        scheduled_start_at: Optional[str] = None,
+        scheduled_stop_at: Optional[str] = None,
+        schedule_enabled: Optional[int] = None,
+        individual_speed_limit: Optional[int] = None,
+        category: Optional[str] = None,
+        max_retry_attempts: Optional[int] = None,
+        next_retry_at: Optional[str] = None,
+        retry_enabled: Optional[int] = None,
+        queue_order: Optional[int] = None,
+        retry_count: Optional[int] = None,
+        error_message: Optional[str] = None,
     ) -> bool:
-        """Updates detected server metadata (ETag, filename, temp_path, total size)."""
+        """Updates detected server metadata (ETag, filename, temp_path, total size) or Stage 5 fields."""
         updates = []
         params = []
         if filename is not None:
@@ -410,6 +471,42 @@ class DatabaseManager:
         if connection_count is not None:
             updates.append("connection_count = ?")
             params.append(connection_count)
+        if priority is not None:
+            updates.append("priority = ?")
+            params.append(priority)
+        if scheduled_start_at is not None:
+            updates.append("scheduled_start_at = ?")
+            params.append(scheduled_start_at)
+        if scheduled_stop_at is not None:
+            updates.append("scheduled_stop_at = ?")
+            params.append(scheduled_stop_at)
+        if schedule_enabled is not None:
+            updates.append("schedule_enabled = ?")
+            params.append(schedule_enabled)
+        if individual_speed_limit is not None:
+            updates.append("individual_speed_limit = ?")
+            params.append(individual_speed_limit)
+        if category is not None:
+            updates.append("category = ?")
+            params.append(category)
+        if max_retry_attempts is not None:
+            updates.append("max_retry_attempts = ?")
+            params.append(max_retry_attempts)
+        if next_retry_at is not None:
+            updates.append("next_retry_at = ?")
+            params.append(next_retry_at)
+        if retry_enabled is not None:
+            updates.append("retry_enabled = ?")
+            params.append(retry_enabled)
+        if queue_order is not None:
+            updates.append("queue_order = ?")
+            params.append(queue_order)
+        if retry_count is not None:
+            updates.append("retry_count = ?")
+            params.append(retry_count)
+        if error_message is not None:
+            updates.append("error_message = ?")
+            params.append(error_message)
 
         if not updates:
             return False
@@ -420,6 +517,46 @@ class DatabaseManager:
             with conn:
                 conn.execute(f"UPDATE downloads SET {', '.join(updates)} WHERE id = ?;", params)
             return True
+
+    def update_priority(self, download_id: str, priority: str) -> bool:
+        return self.update_download_metadata(download_id, priority=priority)
+
+    def update_schedule(
+        self,
+        download_id: str,
+        start_at: Optional[str],
+        stop_at: Optional[str] = None,
+        enabled: bool = True,
+    ) -> bool:
+        return self.update_download_metadata(
+            download_id,
+            scheduled_start_at=start_at,
+            scheduled_stop_at=stop_at,
+            schedule_enabled=1 if enabled else 0,
+        )
+
+    def update_speed_limit(self, download_id: str, limit_bps: int) -> bool:
+        return self.update_download_metadata(download_id, individual_speed_limit=limit_bps)
+
+    def update_category(self, download_id: str, category: str) -> bool:
+        return self.update_download_metadata(download_id, category=category)
+
+    def update_retry_info(
+        self,
+        download_id: str,
+        retry_count: int,
+        next_retry_at: Optional[str] = None,
+        error_message: Optional[str] = None,
+    ) -> bool:
+        return self.update_download_metadata(
+            download_id,
+            retry_count=retry_count,
+            next_retry_at=next_retry_at,
+            error_message=error_message,
+        )
+
+    def update_queue_order(self, download_id: str, queue_order: int) -> bool:
+        return self.update_download_metadata(download_id, queue_order=queue_order)
 
     def remove_download(self, download_id: str) -> bool:
         """Removes a download and cascades deletion of its segments."""

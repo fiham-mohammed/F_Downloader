@@ -5,7 +5,7 @@ import errno
 import logging
 import httpx
 from pathlib import Path
-from typing import Callable, Optional, Tuple
+from typing import Callable, Optional, Tuple, Any
 
 logger = logging.getLogger("mdm.downloader")
 
@@ -15,12 +15,16 @@ from mdm.utils import (
     parse_content_disposition,
     extract_filename_from_url,
     is_strong_etag,
+    parse_retry_after,
 )
 
 
 class DownloadError(Exception):
-    """Raised when a download encounters an unrecoverable error."""
-    pass
+    """Raised when a download encounters an error."""
+    def __init__(self, message: str, status_code: Optional[int] = None, retry_after: Optional[str] = None):
+        super().__init__(message)
+        self.status_code = status_code
+        self.retry_after = retry_after
 
 
 class DownloadCancelledError(Exception):
@@ -34,7 +38,11 @@ class DownloadPausedError(Exception):
 
 
 # Status codes that should trigger an automatic retry
-RETRYABLE_STATUS_CODES = {500, 502, 503, 504}
+RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
+
+# Maximum Retry-After delay (in seconds) that is handled internally by the worker.
+# Values above this threshold promote the failure to queue-level retry scheduling.
+INTERNAL_RETRY_AFTER_MAX_SECONDS = 3.0
 
 # Exceptions from httpx that represent temporary network errors
 RETRYABLE_EXCEPTIONS = (
@@ -112,6 +120,8 @@ class HttpDownloader:
         on_retry: Optional[Callable[[int, int, str], None]] = None,
         on_db_persist: Optional[Callable[[int, float, Optional[float]], None]] = None,
         on_metadata_detected: Optional[Callable[[Optional[str], Optional[str], str, str, Optional[int], bool], None]] = None,
+        bandwidth_controller: Optional[Any] = None,
+        item_id: Optional[str] = None,
         transport: Optional[httpx.BaseTransport] = None,
     ):
         self.url = url.strip()
@@ -122,6 +132,8 @@ class HttpDownloader:
         self.chunk_size = chunk_size
         self.timeout = httpx.Timeout(timeout_seconds, connect=10.0, read=timeout_seconds)
         self.transport = transport
+        self.bandwidth_controller = bandwidth_controller
+        self.item_id = item_id
         self.is_cancelled_cb = is_cancelled or (lambda: False)
         self.is_paused_cb = is_paused or (lambda: False)
         self.probed_etag = etag
@@ -144,6 +156,7 @@ class HttpDownloader:
         self.downloaded_bytes: int = 0
         self.total_bytes: Optional[int] = None
         self.speed: float = 0.0
+        self.last_retry_after: Optional[str] = None
         self.eta: Optional[float] = None
 
     def pause(self):
@@ -234,14 +247,24 @@ class HttpDownloader:
 
                 # 3. HTTP status error
                 is_retryable = False
+                last_status_code = None
+                self.last_retry_after = None
                 if isinstance(exc, httpx.HTTPStatusError):
                     status = exc.response.status_code
+                    last_status_code = status
+                    retry_after_hdr = exc.response.headers.get("retry-after") or exc.response.headers.get("Retry-After")
+                    if retry_after_hdr:
+                        self.last_retry_after = retry_after_hdr.strip()
+
                     if status in RETRYABLE_STATUS_CODES:
                         is_retryable = True
-                        last_error_message = f"HTTP {status} {exc.response.reason_phrase or 'Server Error'}"
+                        reason = exc.response.reason_phrase or ("Too Many Requests" if status == 429 else ("Request Timeout" if status == 408 else "Server Error"))
+                        last_error_message = f"HTTP {status} {reason}"
+                        if self.last_retry_after:
+                            last_error_message += f" (Retry-After: {self.last_retry_after})"
                     else:
                         reason = exc.response.reason_phrase or "Error"
-                        raise DownloadError(f"HTTP {status} {reason}: Permanent error, download failed.") from exc
+                        raise DownloadError(f"HTTP {status} {reason}: Permanent error, download failed.", status_code=status, retry_after=self.last_retry_after) from exc
 
                 # 4. Transient network errors from HTTPX
                 elif isinstance(exc, RETRYABLE_EXCEPTIONS):
@@ -252,21 +275,34 @@ class HttpDownloader:
                 else:
                     raise DownloadError(f"Download failed: {exc}") from exc
 
-                if is_retryable and attempt < self.max_retries:
-                    if self.on_retry_cb:
-                        self.on_retry_cb(attempt, self.max_retries, last_error_message)
-                    # Short backoff while listening for cancellation
-                    sleep_time = min(attempt * 1.0, 3.0)
-                    start_sleep = time.time()
-                    while time.time() - start_sleep < sleep_time:
-                        self._check_cancelled()
-                        time.sleep(0.05)
-                else:
-                    raise DownloadError(
-                        f"Download failed after {self.max_retries} attempts. Last error: {last_error_message}"
-                    )
+                if is_retryable:
+                    parsed_delay = parse_retry_after(self.last_retry_after) if self.last_retry_after else None
+                    if last_status_code in RETRYABLE_STATUS_CODES and parsed_delay is not None and parsed_delay > INTERNAL_RETRY_AFTER_MAX_SECONDS:
+                        raise DownloadError(
+                            last_error_message,
+                            status_code=last_status_code,
+                            retry_after=self.last_retry_after,
+                        )
 
-        raise DownloadError(f"Download failed: {last_error_message or 'Max retries exceeded'}")
+                    if attempt < self.max_retries:
+                        if self.on_retry_cb:
+                            self.on_retry_cb(attempt, self.max_retries, last_error_message)
+                        # Short backoff while listening for cancellation
+                        sleep_time = min(attempt * 1.0, 3.0)
+                        if parsed_delay is not None and 0 <= parsed_delay <= INTERNAL_RETRY_AFTER_MAX_SECONDS:
+                            sleep_time = parsed_delay
+                        start_sleep = time.time()
+                        while time.time() - start_sleep < sleep_time:
+                            self._check_cancelled()
+                            time.sleep(0.05)
+                    else:
+                        raise DownloadError(
+                            f"Download failed after {self.max_retries} attempts. Last error: {last_error_message}",
+                            status_code=last_status_code,
+                            retry_after=self.last_retry_after,
+                        )
+
+        raise DownloadError(f"Download failed: {last_error_message or 'Max retries exceeded'}", status_code=last_status_code, retry_after=self.last_retry_after)
 
     def _attempt_download(self) -> Tuple[Path, int]:
         """
@@ -480,12 +516,26 @@ class HttpDownloader:
                     bytes_at_last_check = self.downloaded_bytes
                     speed_samples = []
 
+                    effective_chunk = self.chunk_size
+                    if self.bandwidth_controller:
+                        effective_chunk = self.bandwidth_controller.get_effective_chunk_size(
+                            self.item_id, self.chunk_size
+                        )
+
                     with open(self.part_path, open_mode) as f:
-                        for chunk in response.iter_bytes(chunk_size=self.chunk_size):
+                        for chunk in response.iter_bytes(chunk_size=effective_chunk):
                             self._check_cancelled()
 
                             if not chunk:
                                 continue
+
+                            if self.bandwidth_controller:
+                                self.bandwidth_controller.acquire(
+                                    len(chunk),
+                                    item_id=self.item_id,
+                                    is_cancelled=self.is_cancelled_cb,
+                                    is_paused=self.is_paused_cb,
+                                )
 
                             f.write(chunk)
                             chunk_len = len(chunk)

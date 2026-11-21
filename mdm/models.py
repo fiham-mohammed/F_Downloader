@@ -36,6 +36,21 @@ class DownloadStatus:
     }
 
 
+class DownloadPriority:
+    HIGH = "High"
+    NORMAL = "Normal"
+    LOW = "Low"
+
+    ALL = [HIGH, NORMAL, LOW]
+
+    # Numeric weights for sorting (lower is higher priority)
+    WEIGHTS = {
+        HIGH: 0,
+        NORMAL: 1,
+        LOW: 2,
+    }
+
+
 VALID_TRANSITIONS = {
     DownloadStatus.QUEUED: {DownloadStatus.DOWNLOADING, DownloadStatus.CANCELLED},
     DownloadStatus.DOWNLOADING: {
@@ -130,6 +145,16 @@ class DownloadModel:
     last_modified: Optional[str] = None
     supports_range: int = 1
     queue_order: int = 0
+    priority: str = "Normal"
+    scheduled_start_at: Optional[str] = None
+    scheduled_stop_at: Optional[str] = None
+    schedule_enabled: int = 0
+    individual_speed_limit: int = 0  # bytes/sec (0 = unlimited)
+    category: str = "Other"
+    retry_count: int = 0
+    max_retry_attempts: int = 3
+    next_retry_at: Optional[str] = None
+    retry_enabled: int = 1
     segments: List[SegmentModel] = field(default_factory=list)
 
     def __post_init__(self):

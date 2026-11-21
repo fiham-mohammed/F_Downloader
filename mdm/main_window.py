@@ -5,21 +5,32 @@ from typing import Optional, Dict, Any, List
 from pathlib import Path
 from urllib.parse import urlparse
 
-from PySide6.QtCore import Qt, QUrl, Slot, QCoreApplication
+from PySide6.QtCore import Qt, QUrl, Slot, QCoreApplication, QDateTime
 from PySide6.QtGui import QColor, QDesktopServices, QGuiApplication
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QFrame, QLabel, QPushButton, QLineEdit,
     QVBoxLayout, QHBoxLayout, QGridLayout, QStackedWidget, QTableWidget,
     QTableWidgetItem, QHeaderView, QDialog, QFormLayout, QFileDialog,
     QSpinBox, QMessageBox, QAbstractItemView, QProgressBar, QMenu,
-    QProgressDialog, QComboBox
+    QProgressDialog, QComboBox, QCheckBox, QDateTimeEdit
 )
 
 from mdm.queue_manager import QueueManager
 from mdm.database import DatabaseManager
-from mdm.models import DownloadStatus
-from mdm.utils import sanitize_filename, extract_filename_from_url, format_bytes
-from mdm.settings import get_default_connections, set_default_connections, VALID_CONNECTION_COUNTS
+from mdm.models import DownloadStatus, DownloadPriority
+from mdm.utils import sanitize_filename, extract_filename_from_url, format_bytes, format_speed
+from mdm.categories import ALL_CATEGORIES, get_category_for_filename
+from mdm.settings import (
+    get_default_connections, set_default_connections, VALID_CONNECTION_COUNTS,
+    get_max_simultaneous_downloads, set_max_simultaneous_downloads,
+    get_default_priority, set_default_priority,
+    get_global_speed_limit, set_global_speed_limit,
+    is_global_speed_limit_enabled, set_global_speed_limit_enabled,
+    get_default_individual_speed_limit, set_default_individual_speed_limit,
+    is_auto_retry_enabled, set_auto_retry_enabled,
+    get_max_retry_attempts, set_max_retry_attempts,
+    app_settings,
+)
 
 
 APP_STYLE = """
@@ -294,6 +305,169 @@ class SegmentDetailsDialog(QDialog):
             self.refresh()
 
 
+class SpeedLimitDialog(QDialog):
+    """Dialog allowing user to configure per-download or global speed limits."""
+    def __init__(self, current_bps: int = 0, title: str = "Set Speed Limit", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.resize(360, 150)
+        layout = QVBoxLayout(self)
+
+        layout.addWidget(QLabel("Download Speed Limit (KB/s):"))
+        self.spin = QSpinBox()
+        self.spin.setRange(0, 1000000)
+        self.spin.setSingleStep(50)
+        self.spin.setValue(int(current_bps / 1024) if current_bps else 0)
+        self.spin.setSuffix(" KB/s (0 = unlimited)")
+        layout.addWidget(self.spin)
+
+        btn_box = QHBoxLayout()
+        btn_box.addStretch()
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        save_btn = QPushButton("Save")
+        save_btn.setObjectName("PrimaryButton")
+        save_btn.clicked.connect(self.accept)
+        btn_box.addWidget(cancel_btn)
+        btn_box.addWidget(save_btn)
+        layout.addLayout(btn_box)
+
+    def get_limit_bps(self) -> int:
+        return self.spin.value() * 1024
+
+
+class ScheduleDownloadDialog(QDialog):
+    """Dialog allowing user to configure scheduled start and stop for a download."""
+    def __init__(self, start_at: Optional[str] = None, stop_at: Optional[str] = None, enabled: bool = False, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Schedule Download")
+        self.resize(440, 260)
+        layout = QVBoxLayout(self)
+
+        self.enable_cb = QCheckBox("Enable Schedule")
+        self.enable_cb.setChecked(enabled)
+        layout.addWidget(self.enable_cb)
+
+        form = QFormLayout()
+
+        self.start_edit = QDateTimeEdit()
+        self.start_edit.setCalendarPopup(True)
+        self.start_edit.setDisplayFormat("yyyy-MM-dd HH:mm:ss")
+        if start_at:
+            dt = QDateTime.fromString(start_at[:19], "yyyy-MM-ddTHH:mm:ss")
+            if not dt.isValid():
+                dt = QDateTime.fromString(start_at[:19], "yyyy-MM-dd HH:mm:ss")
+            self.start_edit.setDateTime(dt if dt.isValid() else QDateTime.currentDateTime().addSecs(300))
+        else:
+            self.start_edit.setDateTime(QDateTime.currentDateTime().addSecs(300))
+
+        self.stop_edit = QDateTimeEdit()
+        self.stop_edit.setCalendarPopup(True)
+        self.stop_edit.setDisplayFormat("yyyy-MM-dd HH:mm:ss")
+        if stop_at:
+            dt = QDateTime.fromString(stop_at[:19], "yyyy-MM-ddTHH:mm:ss")
+            if not dt.isValid():
+                dt = QDateTime.fromString(stop_at[:19], "yyyy-MM-dd HH:mm:ss")
+            self.stop_edit.setDateTime(dt if dt.isValid() else QDateTime.currentDateTime().addSecs(3600))
+        else:
+            self.stop_edit.setDateTime(QDateTime.currentDateTime().addSecs(3600))
+
+        self.has_stop_cb = QCheckBox("Stop download at:")
+        self.has_stop_cb.setChecked(bool(stop_at))
+
+        form.addRow("Start download at:", self.start_edit)
+        form.addRow(self.has_stop_cb, self.stop_edit)
+        layout.addLayout(form)
+
+        btn_box = QHBoxLayout()
+        btn_box.addStretch()
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        save_btn = QPushButton("Save")
+        save_btn.setObjectName("PrimaryButton")
+        save_btn.clicked.connect(self.validate_and_accept)
+        btn_box.addWidget(cancel_btn)
+        btn_box.addWidget(save_btn)
+        layout.addLayout(btn_box)
+
+    def validate_and_accept(self):
+        if self.enable_cb.isChecked() and self.has_stop_cb.isChecked():
+            start_dt = self.start_edit.dateTime()
+            stop_dt = self.stop_edit.dateTime()
+            if stop_dt <= start_dt:
+                QMessageBox.warning(
+                    self, "Invalid Schedule",
+                    "Stop time must be strictly after the start time."
+                )
+                return
+        self.accept()
+
+    def get_schedule(self):
+        enabled = self.enable_cb.isChecked()
+        start_iso = self.start_edit.dateTime().toString("yyyy-MM-ddTHH:mm:ss")
+        stop_iso = self.stop_edit.dateTime().toString("yyyy-MM-ddTHH:mm:ss") if self.has_stop_cb.isChecked() else None
+        return start_iso, stop_iso, enabled
+
+
+class DownloadDetailsDialog(QDialog):
+    """Dialog displaying detailed metadata, scheduler, speed limit, and retry status."""
+    def __init__(self, item: dict, queue_mgr: QueueManager, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Details — {item.get('filename', 'Download')}")
+        self.resize(640, 480)
+        layout = QVBoxLayout(self)
+
+        title = QLabel(item.get("filename", ""))
+        title.setObjectName("PageTitle")
+        layout.addWidget(title)
+
+        form = QFormLayout()
+        form.addRow("URL:", QLabel(item.get("url", "")))
+        form.addRow("Folder:", QLabel(item.get("folder", "")))
+        form.addRow("Status:", QLabel(item.get("status", "")))
+        form.addRow("Size:", QLabel(item.get("size", "Unknown")))
+        form.addRow("Downloaded:", QLabel(format_bytes(item.get("downloaded_bytes", 0))))
+        form.addRow("Category:", QLabel(item.get("category", "Other")))
+        form.addRow("Priority:", QLabel(item.get("priority", "Normal")))
+
+        lim = item.get("individual_speed_limit", 0)
+        lim_str = f"{lim // 1024} KB/s" if lim > 0 else "Unlimited"
+        form.addRow("Speed Limit:", QLabel(lim_str))
+
+        sched_str = "Disabled"
+        if item.get("schedule_enabled"):
+            st = item.get("scheduled_start_at") or "None"
+            sp = item.get("scheduled_stop_at") or "None"
+            sched_str = f"Start: {st} | Stop: {sp}"
+        form.addRow("Schedule:", QLabel(sched_str))
+
+        retries_str = f"{item.get('retry_count', 0)} / {item.get('max_retry_attempts', 3)}"
+        if item.get("next_retry_at"):
+            retries_str += f" (Next: {item['next_retry_at']})"
+        form.addRow("Retries:", QLabel(retries_str))
+
+        if item.get("etag"):
+            form.addRow("ETag:", QLabel(str(item.get("etag"))))
+        if item.get("last_modified"):
+            form.addRow("Last-Modified:", QLabel(str(item.get("last_modified"))))
+        if item.get("error"):
+            err_lbl = QLabel(item.get("error", ""))
+            err_lbl.setStyleSheet("color: #f87171;")
+            form.addRow("Error Message:", err_lbl)
+
+        layout.addLayout(form)
+
+        btn_box = QHBoxLayout()
+        btn_box.addStretch()
+        seg_btn = QPushButton("View Segments…")
+        seg_btn.clicked.connect(lambda: SegmentDetailsDialog(item["id"], queue_mgr, self).exec())
+        btn_box.addWidget(seg_btn)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        btn_box.addWidget(close_btn)
+        layout.addLayout(btn_box)
+
+
 class AddDownloadDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -328,14 +502,26 @@ class AddDownloadDialog(QDialog):
             self.connections_combo.setCurrentIndex(default_idx)
         self.connections_combo.setToolTip("Select number of simultaneous HTTP connections (segments) for this download.")
 
+        self.priority_combo = QComboBox()
+        for p in [DownloadPriority.HIGH, DownloadPriority.NORMAL, DownloadPriority.LOW]:
+            self.priority_combo.addItem(p, p)
+        self.priority_combo.setCurrentText(get_default_priority())
+
+        self.category_combo = QComboBox()
+        self.category_combo.addItem("Auto-detect", "")
+        for cat in ALL_CATEGORIES:
+            self.category_combo.addItem(cat, cat)
+
         form.addRow("Download URL", self.url_input)
         form.addRow("Save folder", folder_row)
         form.addRow("Connections", self.connections_combo)
+        form.addRow("Priority", self.priority_combo)
+        form.addRow("Category", self.category_combo)
         layout.addLayout(form)
 
         note = QLabel(
-            "Stage 3 Engine: Advanced multi-connection downloading via HTTP Range requests. "
-            "Supported files are accelerated using parallel segments with automatic single-connection fallback."
+            "Stage 5 Download Engine: Multi-connection segmented downloading, global/individual speed limiting, "
+            "priority ordering, automatic retries, and scheduled downloads."
         )
         note.setObjectName("Muted")
         note.setWordWrap(True)
@@ -385,11 +571,15 @@ class AddDownloadDialog(QDialog):
 
     def get_data(self):
         url_text = self.url_input.text().strip()
+        cat = self.category_combo.currentData() or None
+        prio = self.priority_combo.currentData() or DownloadPriority.NORMAL
         return {
             "url": url_text,
             "explicit_filename": None,
             "folder": self.folder_input.text().strip(),
             "connections": self.connections_combo.currentData(),
+            "priority": prio,
+            "category": cat,
         }
 
 
@@ -402,6 +592,10 @@ class MainWindow(QMainWindow):
 
         self.db = db
         self.queue_mgr = QueueManager(self, db=self.db)
+        if self.db:
+            app_settings.bind_database(self.db)
+        elif self.queue_mgr.db:
+            app_settings.bind_database(self.queue_mgr.db)
         self.current_filter = "All Downloads"
         self.nav_buttons = {}
         self._item_row_map = {}  # item_id -> row
@@ -462,7 +656,7 @@ class MainWindow(QMainWindow):
 
         sections = [
             ("MAIN", ["Dashboard", "All Downloads", "Downloading", "Completed", "Queue"]),
-            ("LIBRARY", ["Videos", "Documents", "Compressed", "Programs"]),
+            ("LIBRARY", ["Videos", "Audio", "Documents", "Images", "Archives", "Software", "Other"]),
             ("TOOLS", ["Scheduler", "Settings"]),
         ]
 
@@ -481,7 +675,7 @@ class MainWindow(QMainWindow):
                 layout.addWidget(button)
 
         layout.addStretch()
-        version = QLabel("MY DOWNLOAD MANAGER\nStage 4 • Persistence & Recovery")
+        version = QLabel("MY DOWNLOAD MANAGER\nStage 5 • Advanced Management")
         version.setObjectName("Muted")
         version.setStyleSheet("font-size: 8pt;")
         layout.addWidget(version)
@@ -491,9 +685,9 @@ class MainWindow(QMainWindow):
     def nav_icon(name):
         icons = {
             "Dashboard": "▦", "All Downloads": "⇩", "Downloading": "↓",
-            "Completed": "✓", "Queue": "☷", "Videos": "▶",
-            "Documents": "▤", "Compressed": "▧", "Programs": "⚙",
-            "Scheduler": "◷", "Settings": "⚙",
+            "Completed": "✓", "Queue": "☷", "Videos": "▶", "Audio": "♫",
+            "Documents": "▤", "Images": "🖼", "Archives": "▧", "Software": "⚙",
+            "Other": "📁", "Scheduler": "◷", "Settings": "⚙",
         }
         return icons.get(name, "•")
 
@@ -564,30 +758,47 @@ class MainWindow(QMainWindow):
         table_header.addWidget(table_title)
 
         table_header.addSpacing(16)
-        self.btn_start_queue = QPushButton("▶  Start Queued")
-        self.btn_start_queue.setCursor(Qt.PointingHandCursor)
-        self.btn_start_queue.setToolTip("Start processing all queued downloads sequentially")
-        self.btn_start_queue.clicked.connect(self.queue_mgr.start_all)
-        table_header.addWidget(self.btn_start_queue)
+        self.btn_start_all = QPushButton("▶  Start All")
+        self.btn_start_all.setCursor(Qt.PointingHandCursor)
+        self.btn_start_all.setToolTip("Start processing queued downloads")
+        self.btn_start_all.clicked.connect(self.queue_mgr.start_all)
+        table_header.addWidget(self.btn_start_all)
 
-        self.btn_pause = QPushButton("⏸  Pause Active")
-        self.btn_pause.setCursor(Qt.PointingHandCursor)
-        self.btn_pause.setToolTip("Pause the active download safely (preserves partial data)")
-        self.btn_pause.clicked.connect(self.queue_mgr.pause_active)
-        table_header.addWidget(self.btn_pause)
+        self.btn_pause_all = QPushButton("⏸  Pause All")
+        self.btn_pause_all.setCursor(Qt.PointingHandCursor)
+        self.btn_pause_all.setToolTip("Pause all active and queued downloads")
+        self.btn_pause_all.clicked.connect(self.queue_mgr.pause_all)
+        table_header.addWidget(self.btn_pause_all)
 
-        self.btn_resume = QPushButton("▶  Resume")
-        self.btn_resume.setCursor(Qt.PointingHandCursor)
-        self.btn_resume.setToolTip("Resume the selected download or first paused/interrupted download")
-        self.btn_resume.clicked.connect(self._on_resume_clicked)
-        table_header.addWidget(self.btn_resume)
+        self.btn_resume_all = QPushButton("▶  Resume All")
+        self.btn_resume_all.setCursor(Qt.PointingHandCursor)
+        self.btn_resume_all.setToolTip("Resume all paused/failed downloads")
+        self.btn_resume_all.clicked.connect(self.queue_mgr.resume_all)
+        table_header.addWidget(self.btn_resume_all)
 
-        self.btn_cancel = QPushButton("⏹  Cancel Active")
-        self.btn_cancel.setObjectName("DangerButton")
-        self.btn_cancel.setCursor(Qt.PointingHandCursor)
-        self.btn_cancel.setToolTip("Cancel the active download")
-        self.btn_cancel.clicked.connect(self.queue_mgr.cancel_active)
-        table_header.addWidget(self.btn_cancel)
+        self.btn_stop_queue = QPushButton("⏹  Stop Queue")
+        self.btn_stop_queue.setCursor(Qt.PointingHandCursor)
+        self.btn_stop_queue.setToolTip("Stop queue processing and pause active downloads")
+        self.btn_stop_queue.clicked.connect(self.queue_mgr.stop_queue)
+        table_header.addWidget(self.btn_stop_queue)
+
+        self.btn_clear_completed = QPushButton("🧹  Clear Completed")
+        self.btn_clear_completed.setCursor(Qt.PointingHandCursor)
+        self.btn_clear_completed.setToolTip("Remove all completed downloads from queue and history")
+        self.btn_clear_completed.clicked.connect(self._on_clear_completed)
+        table_header.addWidget(self.btn_clear_completed)
+
+        self.btn_move_up = QPushButton("▲  Up")
+        self.btn_move_up.setCursor(Qt.PointingHandCursor)
+        self.btn_move_up.setToolTip("Move selected download up in queue")
+        self.btn_move_up.clicked.connect(self._on_move_up)
+        table_header.addWidget(self.btn_move_up)
+
+        self.btn_move_down = QPushButton("▼  Down")
+        self.btn_move_down.setCursor(Qt.PointingHandCursor)
+        self.btn_move_down.setToolTip("Move selected download down in queue")
+        self.btn_move_down.clicked.connect(self._on_move_down)
+        table_header.addWidget(self.btn_move_down)
 
         table_header.addStretch()
         self.list_hint = QLabel("New links will appear here")
@@ -595,10 +806,10 @@ class MainWindow(QMainWindow):
         table_header.addWidget(self.list_hint)
         panel_layout.addLayout(table_header)
 
-        # 7 Columns: FILE NAME, STATUS, SIZE, PROGRESS, SPEED, ETA, ADDED
-        self.table = QTableWidget(0, 7)
+        # 10 Columns: FILE NAME, STATUS, SIZE, PROGRESS, SPEED, ETA, PRIORITY, CATEGORY, SCHEDULE, ADDED
+        self.table = QTableWidget(0, 10)
         self.table.setHorizontalHeaderLabels(
-            ["FILE NAME", "STATUS", "SIZE", "PROGRESS", "SPEED", "ETA", "ADDED"]
+            ["FILE NAME", "STATUS", "SIZE", "PROGRESS", "SPEED", "ETA", "PRIORITY", "CATEGORY", "SCHEDULE", "ADDED"]
         )
         self.table.setAlternatingRowColors(True)
         self.table.setShowGrid(False)
@@ -612,16 +823,16 @@ class MainWindow(QMainWindow):
 
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.Stretch)
-        for col in range(1, 7):
+        for col in range(1, 10):
             header.setSectionResizeMode(col, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(3, QHeaderView.Interactive)
-        self.table.setColumnWidth(3, 170)
+        self.table.setColumnWidth(3, 160)
 
         panel_layout.addWidget(self.table, 1)
         layout.addWidget(panel, 1)
 
         footer = QLabel(
-            "Stage 4 Engine: Advanced multi-connection downloading with Pause, Resume, SQLite persistence, and crash recovery."
+            "Stage 5 Engine: Advanced Download Management — Multi-connection, Speed Limiter, Scheduler, Priority Queue & Auto-Retry."
         )
         footer.setObjectName("Muted")
         footer.setWordWrap(True)
@@ -655,18 +866,32 @@ class MainWindow(QMainWindow):
         title.setObjectName("PageTitle")
         layout.addWidget(title)
 
-        # Connection Settings Panel
-        conn_box = QFrame()
-        conn_box.setObjectName("Panel")
-        conn_layout = QVBoxLayout(conn_box)
-        conn_layout.setContentsMargins(20, 16, 20, 16)
-        conn_layout.setSpacing(10)
+        # Queue Management Panel
+        queue_box = QFrame()
+        queue_box.setObjectName("Panel")
+        queue_layout = QVBoxLayout(queue_box)
+        queue_layout.setContentsMargins(20, 16, 20, 16)
+        queue_layout.setSpacing(10)
 
-        conn_title = QLabel("Multi-Connection Download Settings")
-        conn_title.setStyleSheet("font-size: 11pt; font-weight: 650;")
-        conn_layout.addWidget(conn_title)
+        queue_title = QLabel("Queue & Priority Management")
+        queue_title.setStyleSheet("font-size: 11pt; font-weight: 650;")
+        queue_layout.addWidget(queue_title)
 
-        form = QFormLayout()
+        q_form = QFormLayout()
+
+        self.max_simul_spin = QSpinBox()
+        self.max_simul_spin.setRange(1, 5)
+        self.max_simul_spin.setValue(get_max_simultaneous_downloads())
+        self.max_simul_spin.valueChanged.connect(self._on_max_simul_changed)
+        q_form.addRow("Max simultaneous downloads (1–5):", self.max_simul_spin)
+
+        self.default_prio_combo = QComboBox()
+        for p in [DownloadPriority.HIGH, DownloadPriority.NORMAL, DownloadPriority.LOW]:
+            self.default_prio_combo.addItem(p, p)
+        self.default_prio_combo.setCurrentText(get_default_priority())
+        self.default_prio_combo.currentTextChanged.connect(self._on_default_prio_changed)
+        q_form.addRow("Default download priority:", self.default_prio_combo)
+
         self.default_conns_combo = QComboBox()
         for c in VALID_CONNECTION_COUNTS:
             self.default_conns_combo.addItem(f"{c} connection{'s' if c > 1 else ''}", c)
@@ -674,37 +899,88 @@ class MainWindow(QMainWindow):
         if idx >= 0:
             self.default_conns_combo.setCurrentIndex(idx)
         self.default_conns_combo.currentIndexChanged.connect(self._on_default_conns_changed)
-        form.addRow("Default connections per download:", self.default_conns_combo)
-        conn_layout.addLayout(form)
+        q_form.addRow("Default connections per download:", self.default_conns_combo)
 
-        conn_hint = QLabel(
-            "Select default simultaneous HTTP connections for downloads (1, 2, 4, 8, 16). "
-            "When a server supports HTTP Range requests, files >= 2 MB are split into parallel segments. "
-            "If range requests are unsupported, downloads automatically fall back to single-connection mode."
-        )
-        conn_hint.setObjectName("Muted")
-        conn_hint.setWordWrap(True)
-        conn_layout.addWidget(conn_hint)
-        layout.addWidget(conn_box)
+        queue_layout.addLayout(q_form)
+        layout.addWidget(queue_box)
 
-        # Stage 4 Information Panel
+        # Speed Limiter Panel
+        speed_box = QFrame()
+        speed_box.setObjectName("Panel")
+        speed_layout = QVBoxLayout(speed_box)
+        speed_layout.setContentsMargins(20, 16, 20, 16)
+        speed_layout.setSpacing(10)
+
+        speed_title = QLabel("Bandwidth & Speed Limiter")
+        speed_title.setStyleSheet("font-size: 11pt; font-weight: 650;")
+        speed_layout.addWidget(speed_title)
+
+        s_form = QFormLayout()
+        self.global_limit_cb = QCheckBox("Enable Global Download Speed Limit")
+        self.global_limit_cb.setChecked(is_global_speed_limit_enabled())
+        self.global_limit_cb.toggled.connect(self._on_global_limit_toggled)
+
+        self.global_limit_spin = QSpinBox()
+        self.global_limit_spin.setRange(10, 1000000)
+        self.global_limit_spin.setSingleStep(50)
+        self.global_limit_spin.setValue(int(get_global_speed_limit() / 1024))
+        self.global_limit_spin.setSuffix(" KB/s")
+        self.global_limit_spin.valueChanged.connect(self._on_global_limit_val_changed)
+
+        self.default_ind_limit_spin = QSpinBox()
+        self.default_ind_limit_spin.setRange(0, 1000000)
+        self.default_ind_limit_spin.setSingleStep(50)
+        self.default_ind_limit_spin.setValue(int(get_default_individual_speed_limit() / 1024))
+        self.default_ind_limit_spin.setSuffix(" KB/s (0 = unlimited)")
+        self.default_ind_limit_spin.valueChanged.connect(self._on_default_ind_limit_changed)
+
+        s_form.addRow(self.global_limit_cb)
+        s_form.addRow("Global Speed Limit:", self.global_limit_spin)
+        s_form.addRow("Default Individual Limit:", self.default_ind_limit_spin)
+        speed_layout.addLayout(s_form)
+        layout.addWidget(speed_box)
+
+        # Auto-Retry Panel
+        retry_box = QFrame()
+        retry_box.setObjectName("Panel")
+        retry_layout = QVBoxLayout(retry_box)
+        retry_layout.setContentsMargins(20, 16, 20, 16)
+        retry_layout.setSpacing(10)
+
+        retry_title = QLabel("Automatic Retry Scheduling")
+        retry_title.setStyleSheet("font-size: 11pt; font-weight: 650;")
+        retry_layout.addWidget(retry_title)
+
+        r_form = QFormLayout()
+        self.auto_retry_cb = QCheckBox("Enable Automatic Retries for Transient Errors")
+        self.auto_retry_cb.setChecked(is_auto_retry_enabled())
+        self.auto_retry_cb.toggled.connect(self._on_auto_retry_toggled)
+
+        self.max_retries_spin = QSpinBox()
+        self.max_retries_spin.setRange(1, 10)
+        self.max_retries_spin.setValue(get_max_retry_attempts())
+        self.max_retries_spin.valueChanged.connect(self._on_max_retries_changed)
+
+        r_form.addRow(self.auto_retry_cb)
+        r_form.addRow("Maximum retry attempts (1–10):", self.max_retries_spin)
+        retry_layout.addLayout(r_form)
+        layout.addWidget(retry_box)
+
+        # Stage 5 Information Panel
         info = QFrame()
         info.setObjectName("Panel")
         info_layout = QVBoxLayout(info)
         info_layout.setContentsMargins(20, 20, 20, 20)
-        info_layout.addWidget(QLabel("My Download Manager — Stage 4: Persistence & Recovery"))
+        info_layout.addWidget(QLabel("My Download Manager — Stage 5: Advanced Download Management"))
 
         description = QLabel(
-            "Stage 4 implements robust SQLite persistence, download pause and resume, crash recovery, "
-            "and multi-connection restart capabilities.\n\n"
-            "Key capabilities:\n"
-            "• SQLite database storage for download history, settings, and segmented progress.\n"
-            "• Pause and resume downloads (both single-connection and multi-connection modes).\n"
-            "• Application restart recovery: resume interrupted downloads from where they stopped.\n"
-            "• Reusable .parts directory and segment state preservation across sessions.\n"
-            "• ETag, Last-Modified, and Content-Range validator consistency.\n"
-            "• Graceful shutdown with automatic download interruption and partial file preservation.\n"
-            "• Safe file finalisation and clean cancellation cleanup."
+            "Stage 5 introduces professional enterprise download manager capabilities:\n\n"
+            "• Global & Per-Download Bandwidth Limiter using token-bucket rate limiting.\n"
+            "• Download Scheduler with timed start/stop and timezone-aware checks.\n"
+            "• Advanced Queue Management: 1–5 simultaneous downloads, High/Normal/Low priorities.\n"
+            "• Automatic Retries: Exponential backoff (5s, 15s, 45s) and Retry-After header respect.\n"
+            "• Category Management: Automatic extension classification and custom filters.\n"
+            "• Full persistence across sessions via SQLite version 2 schema."
         )
         description.setObjectName("Muted")
         description.setWordWrap(True)
@@ -712,6 +988,36 @@ class MainWindow(QMainWindow):
         layout.addWidget(info)
         layout.addStretch()
         return page
+
+    def _on_max_simul_changed(self, val: int):
+        set_max_simultaneous_downloads(val)
+        self.queue_mgr.max_simultaneous_downloads = val
+        self.queue_mgr.start_next()
+
+    def _on_default_prio_changed(self, val: str):
+        set_default_priority(val)
+        self.queue_mgr.default_priority = val
+
+    def _on_global_limit_toggled(self, checked: bool):
+        set_global_speed_limit_enabled(checked)
+        self.queue_mgr.bandwidth_controller.set_global_enabled(checked)
+
+    def _on_global_limit_val_changed(self, val_kb: int):
+        bps = val_kb * 1024
+        set_global_speed_limit(bps)
+        self.queue_mgr.bandwidth_controller.set_global_limit(bps)
+
+    def _on_default_ind_limit_changed(self, val_kb: int):
+        bps = val_kb * 1024
+        set_default_individual_speed_limit(bps)
+
+    def _on_auto_retry_toggled(self, checked: bool):
+        set_auto_retry_enabled(checked)
+        self.queue_mgr.automatic_retry_enabled = checked
+
+    def _on_max_retries_changed(self, val: int):
+        set_max_retry_attempts(val)
+        self.queue_mgr.max_retry_attempts = val
 
     def _on_default_conns_changed(self):
         val = self.default_conns_combo.currentData()
@@ -743,6 +1049,8 @@ class MainWindow(QMainWindow):
                 folder=data["folder"],
                 explicit_filename=data.get("explicit_filename"),
                 connections=data.get("connections"),
+                priority=data.get("priority"),
+                category=data.get("category"),
                 auto_start=True,
             )
 
@@ -821,6 +1129,33 @@ class MainWindow(QMainWindow):
         if eta_item:
             eta_item.setText(item.get("eta", "—"))
 
+        # 6: Priority
+        prio_item = self.table.item(row, 6)
+        if prio_item:
+            prio = item.get("priority", "Normal")
+            prio_item.setText(prio)
+            if prio == DownloadPriority.HIGH:
+                prio_item.setForeground(QColor("#f87171"))
+            elif prio == DownloadPriority.LOW:
+                prio_item.setForeground(QColor("#91a0b7"))
+            else:
+                prio_item.setForeground(QColor("#4c8dff"))
+
+        # 7: Category
+        cat_item = self.table.item(row, 7)
+        if cat_item:
+            cat_item.setText(item.get("category", "Other"))
+
+        # 8: Schedule
+        sched_item = self.table.item(row, 8)
+        if sched_item:
+            if item.get("schedule_enabled") and item.get("scheduled_start_at"):
+                sched_item.setText(f"Starts: {item['scheduled_start_at'][:16].replace('T', ' ')}")
+            elif item.get("schedule_enabled") and item.get("scheduled_stop_at"):
+                sched_item.setText(f"Stops: {item['scheduled_stop_at'][:16].replace('T', ' ')}")
+            else:
+                sched_item.setText("—")
+
     def _color_status_item(self, item: QTableWidgetItem, status: str):
         color_map = {
             "Queued": QColor("#e5b839"),
@@ -842,12 +1177,6 @@ class MainWindow(QMainWindow):
 
         query = self.search_input.text().strip().lower()
         rows = []
-        category_extensions = {
-            "Videos": {".mp4", ".mkv", ".avi", ".mov", ".webm"},
-            "Documents": {".pdf", ".doc", ".docx", ".xls", ".xlsx", ".txt", ".ppt", ".pptx"},
-            "Compressed": {".zip", ".rar", ".7z", ".tar", ".gz"},
-            "Programs": {".exe", ".msi", ".msix", ".dmg", ".deb"},
-        }
 
         for item in self.queue_mgr.items:
             name = item["filename"]
@@ -861,8 +1190,10 @@ class MainWindow(QMainWindow):
                 continue
             if selected == "Queue" and item["status"] not in ("Queued", "Paused", "Interrupted"):
                 continue
-            if selected in category_extensions:
-                if Path(name).suffix.lower() not in category_extensions[selected]:
+            if selected == "Scheduler" and not (item.get("schedule_enabled") or item.get("scheduled_start_at") or item.get("scheduled_stop_at")):
+                continue
+            if selected in ALL_CATEGORIES:
+                if item.get("category") != selected:
                     continue
             rows.append(item)
 
@@ -917,10 +1248,57 @@ class MainWindow(QMainWindow):
             # 5: ETA
             self.table.setItem(row, 5, QTableWidgetItem(item.get("eta", "—")))
 
-            # 6: Added
-            self.table.setItem(row, 6, QTableWidgetItem(item.get("added", "")))
+            # 6: Priority
+            p_item = QTableWidgetItem(item.get("priority", "Normal"))
+            prio = item.get("priority", "Normal")
+            if prio == DownloadPriority.HIGH:
+                p_item.setForeground(QColor("#f87171"))
+            elif prio == DownloadPriority.LOW:
+                p_item.setForeground(QColor("#91a0b7"))
+            else:
+                p_item.setForeground(QColor("#4c8dff"))
+            self.table.setItem(row, 6, p_item)
+
+            # 7: Category
+            self.table.setItem(row, 7, QTableWidgetItem(item.get("category", "Other")))
+
+            # 8: Schedule
+            if item.get("schedule_enabled") and item.get("scheduled_start_at"):
+                sc_str = f"Starts: {item['scheduled_start_at'][:16].replace('T', ' ')}"
+            elif item.get("schedule_enabled") and item.get("scheduled_stop_at"):
+                sc_str = f"Stops: {item['scheduled_stop_at'][:16].replace('T', ' ')}"
+            else:
+                sc_str = "—"
+            self.table.setItem(row, 8, QTableWidgetItem(sc_str))
+
+            # 9: Added
+            self.table.setItem(row, 9, QTableWidgetItem(item.get("added", "")))
 
         self.list_hint.setText(f"{len(rows)} item(s) shown")
+
+    def _on_clear_completed(self):
+        self.queue_mgr.clear_completed()
+        self.refresh_table()
+
+    def _on_move_up(self):
+        selected_rows = self.table.selectionModel().selectedRows() if self.table.selectionModel() else []
+        if selected_rows:
+            row = selected_rows[0].row()
+            for item_id, r in self._item_row_map.items():
+                if r == row:
+                    self.queue_mgr.move_up(item_id)
+                    self.refresh_table()
+                    return
+
+    def _on_move_down(self):
+        selected_rows = self.table.selectionModel().selectedRows() if self.table.selectionModel() else []
+        if selected_rows:
+            row = selected_rows[0].row()
+            for item_id, r in self._item_row_map.items():
+                if r == row:
+                    self.queue_mgr.move_down(item_id)
+                    self.refresh_table()
+                    return
 
     def _on_resume_clicked(self):
         """Resumes selected download item or first paused/interrupted download in queue."""
@@ -976,8 +1354,38 @@ class MainWindow(QMainWindow):
             action_cancel = menu.addAction("⏹  Cancel Download")
             action_cancel.triggered.connect(lambda: self.queue_mgr.cancel_download(item_id))
         elif status in ("Failed", "Cancelled"):
-            action_retry = menu.addAction("🔄  Retry / Resume")
-            action_retry.triggered.connect(lambda: self.queue_mgr.resume_download(item_id))
+            action_retry = menu.addAction("🔄  Retry Now")
+            action_retry.triggered.connect(lambda: self.queue_mgr.manual_retry(item_id))
+
+        if download_item.get("next_retry_at"):
+            action_cancel_retry = menu.addAction("❌  Cancel Pending Retry")
+            action_cancel_retry.triggered.connect(lambda: self.queue_mgr.cancel_pending_retry(item_id))
+
+        menu.addSeparator()
+
+        # Priority submenu
+        prio_menu = menu.addMenu("⚡  Set Priority")
+        for prio in [DownloadPriority.HIGH, DownloadPriority.NORMAL, DownloadPriority.LOW]:
+            act = prio_menu.addAction(prio)
+            act.triggered.connect(lambda checked=False, p=prio: self.queue_mgr.set_priority(item_id, p))
+
+        # Category submenu
+        cat_menu = menu.addMenu("🏷  Change Category")
+        for cat in ALL_CATEGORIES:
+            act = cat_menu.addAction(cat)
+            act.triggered.connect(lambda checked=False, c=cat: self.queue_mgr.set_category(item_id, c))
+
+        # Speed limit action
+        action_speed = menu.addAction("⏱  Set Speed Limit…")
+        action_speed.triggered.connect(lambda: self._open_speed_limit_dialog(item_id))
+
+        # Schedule action
+        action_sched = menu.addAction("📅  Schedule Download…")
+        action_sched.triggered.connect(lambda: self._open_schedule_dialog(item_id))
+
+        # Details action
+        action_details = menu.addAction("ℹ️  View Details…")
+        action_details.triggered.connect(lambda: DownloadDetailsDialog(download_item, self.queue_mgr, self).exec())
 
         menu.addSeparator()
 
@@ -1002,6 +1410,26 @@ class MainWindow(QMainWindow):
         action_delete.triggered.connect(lambda: self._remove_item(item_id, delete_file=True))
 
         menu.exec(self.table.viewport().mapToGlobal(pos))
+
+    def _open_speed_limit_dialog(self, item_id: str):
+        item = self.queue_mgr.get_item(item_id)
+        if item:
+            dlg = SpeedLimitDialog(current_bps=item.get("individual_speed_limit", 0), parent=self)
+            if dlg.exec() == QDialog.Accepted:
+                self.queue_mgr.set_individual_speed_limit(item_id, dlg.get_limit_bps())
+
+    def _open_schedule_dialog(self, item_id: str):
+        item = self.queue_mgr.get_item(item_id)
+        if item:
+            dlg = ScheduleDownloadDialog(
+                start_at=item.get("scheduled_start_at"),
+                stop_at=item.get("scheduled_stop_at"),
+                enabled=bool(item.get("schedule_enabled")),
+                parent=self,
+            )
+            if dlg.exec() == QDialog.Accepted:
+                st, sp, en = dlg.get_schedule()
+                self.queue_mgr.set_schedule(item_id, st, sp, en)
 
     def open_segment_dialog(self, item_id: str):
         item = self.queue_mgr.get_item(item_id)
@@ -1074,5 +1502,7 @@ class MainWindow(QMainWindow):
                 )
                 event.ignore()
                 return
+        else:
+            self.queue_mgr.shutdown()
 
         event.accept()

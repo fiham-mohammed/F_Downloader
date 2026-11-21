@@ -19,6 +19,7 @@ from mdm.utils import (
     safe_finalize_file,
     parse_content_disposition,
     extract_filename_from_url,
+    parse_retry_after,
 )
 from mdm.downloader import (
     HttpDownloader,
@@ -27,6 +28,7 @@ from mdm.downloader import (
     DownloadPausedError,
     RETRYABLE_STATUS_CODES,
     RETRYABLE_EXCEPTIONS,
+    INTERNAL_RETRY_AFTER_MAX_SECONDS,
     is_local_disk_error,
 )
 from mdm.settings import get_min_segment_size
@@ -161,6 +163,8 @@ class SegmentedDownloader:
         on_connection_status: Optional[Callable[[int, int, str], None]] = None,
         on_db_persist: Optional[Callable[..., None]] = None,
         on_metadata_detected: Optional[Callable[[Optional[str], Optional[str], str, str, Optional[int], bool], None]] = None,
+        bandwidth_controller: Optional[Any] = None,
+        item_id: Optional[str] = None,
         transport: Optional[httpx.BaseTransport] = None,
     ):
         self.url = url.strip()
@@ -172,6 +176,8 @@ class SegmentedDownloader:
         self.timeout = httpx.Timeout(timeout_seconds, connect=10.0, read=timeout_seconds)
         self.min_segment_size = min_segment_size if min_segment_size is not None else get_min_segment_size()
         self.transport = transport
+        self.bandwidth_controller = bandwidth_controller
+        self.item_id = item_id
 
         self.is_cancelled_cb = is_cancelled or (lambda: False)
         self.is_paused_cb = is_paused or (lambda: False)
@@ -212,6 +218,7 @@ class SegmentedDownloader:
         self._wire_bytes_received: int = 0
         self._fatal_error: bool = False
         self._fatal_exception: Optional[Exception] = None
+        self.last_retry_after: Optional[str] = None
 
     def _abort_active_streams(self):
         """Immediately closes all active HTTP responses and clients to unblock threads."""
@@ -529,6 +536,19 @@ class SegmentedDownloader:
                                 total_size = int(cl)
                             return False, total_size, detected_name, etag, last_modified
 
+                        if response.status_code in RETRYABLE_STATUS_CODES:
+                            hdr_ra = response.headers.get("retry-after") or response.headers.get("Retry-After")
+                            ra_val = hdr_ra.strip() if hdr_ra else None
+                            parsed = parse_retry_after(ra_val) if ra_val else None
+                            if parsed is not None and parsed > INTERNAL_RETRY_AFTER_MAX_SECONDS:
+                                with self._lock:
+                                    self.last_retry_after = ra_val
+                                reason = response.reason_phrase or "Server Error"
+                                msg = f"HTTP {response.status_code} {reason}"
+                                if ra_val:
+                                    msg += f" (Retry-After: {ra_val})"
+                                raise DownloadError(msg, status_code=response.status_code, retry_after=ra_val)
+
                         if response.status_code != 206:
                             # Range rejected or error
                             return False, None, detected_name, etag, last_modified
@@ -555,6 +575,8 @@ class SegmentedDownloader:
                     with self._lock:
                         if client in self._active_clients:
                             self._active_clients.remove(client)
+        except DownloadError:
+            raise
         except Exception:
             return False, None, "", None, None
 
@@ -584,6 +606,8 @@ class SegmentedDownloader:
             on_retry=self.on_retry_cb,
             on_metadata_detected=self.on_metadata_detected_cb,
             on_db_persist=self.on_db_persist_cb,
+            bandwidth_controller=self.bandwidth_controller,
+            item_id=self.item_id,
             transport=self.transport,
         )
 
@@ -595,6 +619,9 @@ class SegmentedDownloader:
             self.final_path = final_path
             self.downloaded_bytes = total_downloaded
             return final_path, total_downloaded
+        except Exception:
+            self.last_retry_after = getattr(downloader, "last_retry_after", None)
+            raise
         finally:
             with self._lock:
                 self._active_fallback_downloader = None
@@ -667,14 +694,20 @@ class SegmentedDownloader:
                     self._check_cancelled()
                     future.result()
             except Exception as exc:
-                with self._lock:
-                    self._fatal_error = True
-                    if not self._fatal_exception:
-                        self._fatal_exception = exc
                 self._abort_active_streams()
                 for f in futures:
                     f.cancel()
-                raise
+                with self._lock:
+                    if not self._fatal_error:
+                        self._fatal_error = True
+                        self._fatal_exception = exc
+                        ra = getattr(exc, "retry_after", None)
+                        if ra is not None:
+                            self.last_retry_after = ra
+                    fatal_exc = self._fatal_exception
+                if fatal_exc is not None:
+                    raise fatal_exc
+                raise exc
 
         # All segments completed successfully! Now merge them.
         self._check_cancelled()
@@ -688,6 +721,16 @@ class SegmentedDownloader:
 
         return final_path, total_size
 
+    def _record_fatal_error(self, exc: Exception, retry_after: Optional[str] = None):
+        """Thread-safely records the first fatal exception and updates last_retry_after."""
+        with self._lock:
+            if not self._fatal_error:
+                self._fatal_error = True
+                self._fatal_exception = exc
+                ra = retry_after or getattr(exc, "retry_after", None)
+                if ra is not None:
+                    self.last_retry_after = ra
+
     def _download_single_segment(
         self,
         segment: Segment,
@@ -698,6 +741,7 @@ class SegmentedDownloader:
         """
         Downloads a single segment with independent retries (up to max_retries).
         Validates HTTP 206, Content-Range, and exact byte counts.
+        Uses segment-local retry_after_header to avoid cross-thread contamination.
         """
         attempt = 0
         last_error = ""
@@ -740,9 +784,7 @@ class SegmentedDownloader:
                 raise
             except RangeNotSupportedError as rne:
                 segment.status = "Failed"
-                with self._lock:
-                    self._fatal_error = True
-                    self._fatal_exception = rne
+                self._record_fatal_error(rne)
                 self._abort_active_streams()
                 raise
             except SegmentValidationError as sve:
@@ -753,9 +795,7 @@ class SegmentedDownloader:
                         segment.part_file.unlink(missing_ok=True)
                     except Exception:
                         pass
-                with self._lock:
-                    self._fatal_error = True
-                    self._fatal_exception = sve
+                self._record_fatal_error(sve)
                 self._abort_active_streams()
                 raise sve
             except Exception as exc:
@@ -764,32 +804,40 @@ class SegmentedDownloader:
                 if is_local_disk_error(exc):
                     segment.status = "Failed"
                     segment.error = f"Disk error: {exc}"
-                    with self._lock:
-                        self._fatal_error = True
-                        self._fatal_exception = exc
+                    de = DownloadError(f"Disk error on segment {segment.index}: {exc}")
+                    self._record_fatal_error(de)
                     self._abort_active_streams()
-                    raise DownloadError(f"Disk error on segment {segment.index}: {exc}") from exc
+                    raise de from exc
 
+                # Per-segment local Retry-After — never shared across threads
                 is_retryable = False
+                last_code = None
+                retry_after_header = None
+
                 if isinstance(exc, httpx.HTTPStatusError):
                     code = exc.response.status_code
+                    last_code = code
                     if code == 200:
                         rne = RangeNotSupportedError(f"Server returned 200 OK instead of 206 for segment {segment.index}")
                         segment.status = "Failed"
-                        with self._lock:
-                            self._fatal_error = True
-                            self._fatal_exception = rne
+                        self._record_fatal_error(rne)
                         self._abort_active_streams()
                         raise rne
+
+                    hdr_ra = exc.response.headers.get("retry-after") or exc.response.headers.get("Retry-After")
+                    if hdr_ra:
+                        retry_after_header = hdr_ra.strip()
+
                     if code in RETRYABLE_STATUS_CODES:
                         is_retryable = True
-                        last_error = f"HTTP {code}"
+                        reason = exc.response.reason_phrase or ("Too Many Requests" if code == 429 else ("Request Timeout" if code == 408 else "Server Error"))
+                        last_error = f"HTTP {code} {reason}"
+                        if retry_after_header:
+                            last_error += f" (Retry-After: {retry_after_header})"
                     else:
                         segment.status = "Failed"
-                        de = DownloadError(f"Permanent HTTP error {code} on segment {segment.index}")
-                        with self._lock:
-                            self._fatal_error = True
-                            self._fatal_exception = de
+                        de = DownloadError(f"Permanent HTTP error {code} on segment {segment.index}", status_code=code, retry_after=retry_after_header)
+                        self._record_fatal_error(de, retry_after_header)
                         self._abort_active_streams()
                         raise de from exc
 
@@ -800,24 +848,43 @@ class SegmentedDownloader:
                     last_error = str(exc)
 
                 segment.error = last_error
-                if is_retryable and attempt < self.max_retries:
-                    if segment.part_file and segment.part_file.exists():
-                        try:
-                            segment.part_file.unlink(missing_ok=True)
-                        except Exception:
-                            pass
-                    segment.downloaded_bytes = 0
-                    time.sleep(min(attempt * 0.5, 2.0))
-                else:
-                    segment.status = "Failed"
-                    de = DownloadError(
-                        f"Segment {segment.index} failed after {self.max_retries} attempts: {last_error}"
-                    )
-                    with self._lock:
-                        self._fatal_error = True
-                        self._fatal_exception = de
-                    self._abort_active_streams()
-                    raise de
+                if is_retryable:
+                    parsed_delay = parse_retry_after(retry_after_header) if retry_after_header else None
+                    if last_code in RETRYABLE_STATUS_CODES and parsed_delay is not None and parsed_delay > INTERNAL_RETRY_AFTER_MAX_SECONDS:
+                        segment.status = "Failed"
+                        de = DownloadError(
+                            f"Segment {segment.index} failed: {last_error}",
+                            status_code=last_code,
+                            retry_after=retry_after_header,
+                        )
+                        self._record_fatal_error(de, retry_after_header)
+                        self._abort_active_streams()
+                        raise de
+
+                    if attempt < self.max_retries:
+                        if segment.part_file and segment.part_file.exists():
+                            try:
+                                segment.part_file.unlink(missing_ok=True)
+                            except Exception:
+                                pass
+                        segment.downloaded_bytes = 0
+                        sleep_dur = min(attempt * 1.0, 3.0)
+                        if parsed_delay is not None and 0 <= parsed_delay <= INTERNAL_RETRY_AFTER_MAX_SECONDS:
+                            sleep_dur = parsed_delay
+                        start_s = time.time()
+                        while time.time() - start_s < sleep_dur:
+                            self._check_segment_aborted()
+                            time.sleep(0.05)
+                    else:
+                        segment.status = "Failed"
+                        de = DownloadError(
+                            f"Segment {segment.index} failed after {self.max_retries} attempts: {last_error}",
+                            status_code=last_code,
+                            retry_after=retry_after_header,
+                        )
+                        self._record_fatal_error(de, retry_after_header)
+                        self._abort_active_streams()
+                        raise de
 
     def _stream_segment_to_file(
         self,
@@ -930,11 +997,26 @@ class SegmentedDownloader:
 
                         # Write segment bytes to part file
                         segment.downloaded_bytes = current_offset
+                        effective_chunk = self.chunk_size
+                        if self.bandwidth_controller:
+                            effective_chunk = self.bandwidth_controller.get_effective_chunk_size(
+                                self.item_id, self.chunk_size
+                            )
+
                         with open(segment.part_file, open_mode) as f:
-                            for chunk in response.iter_bytes(chunk_size=self.chunk_size):
+                            for chunk in response.iter_bytes(chunk_size=effective_chunk):
                                 self._check_segment_aborted()
                                 if not chunk:
                                     continue
+
+                                if self.bandwidth_controller:
+                                    self.bandwidth_controller.acquire(
+                                        len(chunk),
+                                        item_id=self.item_id,
+                                        is_cancelled=self.is_cancelled_cb,
+                                        is_paused=self.is_paused_cb,
+                                    )
+
                                 f.write(chunk)
                                 chunk_len = len(chunk)
                                 with self._lock:

@@ -21,6 +21,7 @@ class DownloadWorker(QObject):
     metadata_detected = Signal(str, dict)               # item_id, metadata_dict
     completed = Signal(str, str, int)                   # item_id, final_path, file_size
     failed = Signal(str, str)                           # item_id, error_message
+    failed_with_details = Signal(str, str, dict)        # item_id, error_message, failure_details
     cancelled = Signal(str)                             # item_id
     paused = Signal(str)                                # item_id (Stage 4)
     retry = Signal(str, int, int, str)                  # item_id, attempt, max_attempts, message
@@ -43,6 +44,7 @@ class DownloadWorker(QObject):
         temp_path: Optional[str | Path] = None,
         resumed_segments: Optional[List[Any]] = None,
         on_db_persist: Optional[Callable[..., None]] = None,
+        bandwidth_controller: Optional[Any] = None,
         transport: Optional[Any] = None,
         parent: Optional[QObject] = None,
     ):
@@ -59,7 +61,9 @@ class DownloadWorker(QObject):
         self.temp_path = temp_path
         self.resumed_segments = resumed_segments
         self.on_db_persist_cb = on_db_persist
+        self.bandwidth_controller = bandwidth_controller
         self.transport = transport
+        self.last_failure_details: Dict[str, Any] = {}
 
         self._is_cancelled = False
         self._is_paused = False
@@ -168,6 +172,8 @@ class DownloadWorker(QObject):
                     on_segments_updated=self._on_segments_updated,
                     on_connection_status=self._on_connection_status,
                     on_metadata_detected=self._on_metadata_detected,
+                    bandwidth_controller=self.bandwidth_controller,
+                    item_id=self.item_id,
                     transport=self.transport,
                 )
             else:
@@ -187,6 +193,8 @@ class DownloadWorker(QObject):
                     on_filename_detected=self._on_filename_detected,
                     on_retry=self._on_retry,
                     on_metadata_detected=self._on_metadata_detected,
+                    bandwidth_controller=self.bandwidth_controller,
+                    item_id=self.item_id,
                     transport=self.transport,
                 )
                 self.connection_status.emit(self.item_id, 1, 1, "Single connection")
@@ -202,6 +210,20 @@ class DownloadWorker(QObject):
         except DownloadCancelledError:
             self.cancelled.emit(self.item_id)
         except Exception as exc:
-            self.failed.emit(self.item_id, str(exc))
+            retry_after_val = getattr(exc, "retry_after", None)
+            if not retry_after_val and self._downloader:
+                retry_after_val = getattr(self._downloader, "last_retry_after", None)
+            status_code_val = getattr(exc, "status_code", None)
+
+            self.last_failure_details = {
+                "status_code": status_code_val,
+                "retry_after": retry_after_val,
+                "error_message": str(exc),
+            }
+            msg = str(exc)
+            if retry_after_val and "retry-after" not in msg.lower():
+                msg = f"{msg} (Retry-After: {retry_after_val})"
+            self.failed.emit(self.item_id, msg)
+            self.failed_with_details.emit(self.item_id, msg, self.last_failure_details)
         finally:
             self.finished.emit()
