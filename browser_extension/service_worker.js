@@ -19,6 +19,22 @@
 //    popup. At most 20 are kept; each is removed on successful delivery or
 //    when the user clicks Dismiss. Nothing is synced (storage.sync is unused).
 //  * URLs with embedded "user:password@" credentials are rejected.
+//
+// Stage 6B automatic capture (lib/capture.js) is OFF unless the user turns it on
+// in the popup or the desktop app. It needs the optional "downloads" and
+// "webRequest" permissions plus http/https host access, requested only after a
+// click. webRequest is used in observe-only mode to confirm that a download was a
+// plain GET and to read its Content-Disposition filename. Observations stay in
+// memory (two minutes; thirty for a GET that delivered a PDF document or an
+// image, which the PDF viewer's Download button and "Save image as…" re-request
+// from the cache). Session storage holds only SHA-256 fingerprints of those
+// URLs. Cookies are never read: downloads that need the browser session are
+// detected by the desktop app and left in the browser.
+//
+// PDFs: a PDF link that the browser *displays* in its built-in viewer is a
+// navigation, not a download, so downloads.onCreated never fires for it and it
+// is deliberately left alone (use the right-click menu). Clicking the viewer's
+// Download button creates a real download, which is captured like any other.
 
 import {
   NATIVE_HOST_NAME,
@@ -31,6 +47,8 @@ import {
   connectionStatusFromResponse,
   isRetryable,
 } from "./lib/validation.js";
+import { createCaptureController } from "./lib/capture.js";
+import { CAPTURE_PERMISSIONS, OBSERVED_RESOURCE_TYPES } from "./lib/capture_rules.js";
 
 export const MENU_ID = "mdm-download-link";
 export const MENU_TITLE = "Download with My Download Manager";
@@ -160,6 +178,122 @@ export async function submitDownload({ url, referrer = null, pageTitle = null },
 }
 
 // ------------------------------------------------------------ popup bridge
+// ------------------------------------------------- Stage 6B: automatic capture
+// Permissions needed only for automatic capture (CAPTURE_PERMISSIONS) are
+// OPTIONAL and requested from the popup after an explicit user action; the
+// extension never asks for cookies, history, tabs or passwords.
+export { CAPTURE_PERMISSIONS };
+
+function callbackApi(namespace, method) {
+  return (...args) => new Promise((resolve, reject) => {
+    const ns = chrome[namespace];
+    if (!ns || typeof ns[method] !== "function") {
+      reject(new Error(`${namespace}.${method} is unavailable (permission not granted)`));
+      return;
+    }
+    ns[method](...args, (result) => {
+      const err = chrome.runtime.lastError;
+      if (err) reject(new Error(err.message));
+      else resolve(result);
+    });
+  });
+}
+
+const downloadsApi = {
+  pause: callbackApi("downloads", "pause"),
+  resume: callbackApi("downloads", "resume"),
+  cancel: callbackApi("downloads", "cancel"),
+  search: callbackApi("downloads", "search"),
+  download: callbackApi("downloads", "download"),
+};
+
+export async function hasCapturePermissions() {
+  try {
+    return !!(chrome.permissions && await chrome.permissions.contains(CAPTURE_PERMISSIONS));
+  } catch (_e) {
+    return false;
+  }
+}
+
+export const capture = createCaptureController({
+  downloads: downloadsApi,
+  storageLocal: chrome.storage.local,
+  storageSession: chrome.storage.session || chrome.storage.local,
+  sendNative,
+  notify,
+  browser: BROWSER,
+  extensionId: chrome.runtime.id,
+  extensionVersion: chrome.runtime.getManifest().version,
+  hasPermissions: hasCapturePermissions,
+  // Privacy-safe decision summary (no URL) shown in the desktop app's
+  // Browser Integration settings. Fire-and-forget; never affects a capture.
+  reportDiagnostic: (entry) => sendNative({ action: "report_capture_decision", browser: BROWSER, decision: entry }),
+});
+
+let downloadListenersRegistered = false;
+let webRequestListenerRegistered = false;
+
+/** Registers capture listeners once their (optional) permissions exist. */
+export function registerCaptureListeners() {
+  if (!downloadListenersRegistered && chrome.downloads && chrome.downloads.onCreated) {
+    chrome.downloads.onCreated.addListener((item) => { capture.handleCreated(item); });
+    chrome.downloads.onChanged.addListener((delta) => capture.handleChanged(delta));
+    downloadListenersRegistered = true;
+    capture.recover();
+  }
+  if (!webRequestListenerRegistered && chrome.webRequest && chrome.webRequest.onHeadersReceived) {
+    // Observes only the request method, status, resource type, Content-Type and the
+    // Content-Disposition filename of top-level/frame/image/download responses, to
+    // verify that a download was a plain GET. Nothing is blocked, modified or sent;
+    // the URL stays in memory and only its SHA-256 fingerprint is kept in session
+    // storage (so a restarted service worker can still confirm the method).
+    const filter = { urls: CAPTURE_PERMISSIONS.origins, types: [...OBSERVED_RESOURCE_TYPES] };
+    chrome.webRequest.onHeadersReceived.addListener(
+      (details) => capture.recordResponse(details),
+      filter,
+      ["responseHeaders"],
+    );
+    // Responses served from the HTTP cache (the PDF viewer's Download button,
+    // "Save image as…") never reach onHeadersReceived; onResponseStarted reports
+    // them, with the same observe-only filter.
+    if (chrome.webRequest.onResponseStarted) {
+      chrome.webRequest.onResponseStarted.addListener(
+        (details) => capture.recordResponse(details),
+        filter,
+        ["responseHeaders"],
+      );
+    }
+    webRequestListenerRegistered = true;
+  }
+}
+
+registerCaptureListeners();
+if (chrome.permissions && chrome.permissions.onAdded) {
+  chrome.permissions.onAdded.addListener(() => registerCaptureListeners());
+}
+
+async function getCaptureState() {
+  const permissions = await hasCapturePermissions();
+  const config = await capture.getConfig({ refresh: true });
+  const captures = await capture.listCaptures();
+  const diagnostics = await capture.listDiagnostics();
+  const err = capture.lastConfigError;
+  return {
+    ok: !config.unreachable,
+    permissions,
+    mode: config.mode || "disabled",
+    preferred_mode: config.preferred_mode || "ask",
+    extensions: config.extensions || [],
+    excluded_sites: config.excluded_sites || [],
+    pending_desktop: config.pending || 0,
+    fallbacks: Array.isArray(config.fallbacks) ? config.fallbacks : [],
+    captures,
+    diagnostics: diagnostics.slice(0, 10),
+    connection_status: config.unreachable ? connectionStatusFromResponse(err) : "connected",
+    message: config.unreachable ? ((err && err.message) || "My Download Manager is not reachable.") : "",
+  };
+}
+
 async function getStatus() {
   const response = await sendNative({ action: "ping", request_id: newRequestId() });
   return {
@@ -183,6 +317,22 @@ export async function handlePopupMessage(request) {
       return submitDownload({ url: request.url });
     case "openApp":
       return sendNative({ action: "open_app", request_id: newRequestId() });
+    case "openSettings":
+      return sendNative({ action: "open_app", request_id: newRequestId(), page: "settings" });
+    case "getCaptureState":
+      return getCaptureState();
+    case "setCaptureMode": {
+      if (!["disabled", "ask", "automatic"].includes(request.mode)) return { ok: false, message: "Unknown mode." };
+      if (request.mode !== "disabled" && !(await hasCapturePermissions())) {
+        return { ok: false, message: "Browser permissions for automatic capture were not granted." };
+      }
+      registerCaptureListeners();
+      return capture.setMode(request.mode);
+    }
+    case "claimFallback":
+      return capture.claimFallback(request.requestId);
+    case "retryCaptureFallback":
+      return capture.retryFallback(request.requestId);
     case "listPending":
       return { pending: await getPending() };
     case "retryPending": {

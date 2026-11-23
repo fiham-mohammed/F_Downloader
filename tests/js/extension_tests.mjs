@@ -299,3 +299,66 @@ await test("signed_url_query_forwarded_intact", async () => {
   await sw.submitDownload({ url: signed });
   assert.equal(calls.native[0].msg.url, signed);
 });
+
+// ------------------------------------------------ Stage 6B: service worker level
+await test("capture_permission_denied_blocks_enabling", async () => {
+  // The mocked browser has no `permissions` API grant: enabling must be refused
+  // without contacting the desktop app, and nothing else changes.
+  const r = await sw.handlePopupMessage({ type: "setCaptureMode", mode: "automatic" });
+  assert.equal(r.ok, false);
+  assert.match(r.message, /permissions/i);
+  assert.equal(calls.native.length, 0);
+  assert.equal(await sw.hasCapturePermissions(), false);
+});
+
+await test("capture_listeners_registered_only_after_permission_grant", async () => {
+  const added = { created: 0, changed: 0, headers: 0, filter: null, extra: null };
+  chrome.downloads = {
+    onCreated: { addListener: () => { added.created += 1; } },
+    onChanged: { addListener: () => { added.changed += 1; } },
+    search: (_q, cb) => cb([]),
+  };
+  chrome.webRequest = {
+    onHeadersReceived: { addListener: (_fn, filter, extra) => { added.headers += 1; added.filter = filter; added.extra = extra; } },
+    onResponseStarted: { addListener: (_fn, filter, extra) => { added.started = { filter, extra }; } },
+  };
+  sw.registerCaptureListeners();
+  sw.registerCaptureListeners();  // idempotent
+  assert.deepEqual([added.created, added.changed, added.headers], [1, 1, 1]);
+  assert.deepEqual(added.filter.urls, ["http://*/*", "https://*/*"]);
+  assert.deepEqual(added.extra, ["responseHeaders"], "observe only: never blocking");
+  // Stage 6B repair: images are observed too, and cached responses via onResponseStarted (also observe-only).
+  assert.deepEqual(added.filter.types, ["main_frame", "sub_frame", "other", "image"]);
+  assert.deepEqual(added.started.filter, added.filter);
+  assert.deepEqual(added.started.extra, ["responseHeaders"]);
+  delete chrome.downloads;
+  delete chrome.webRequest;
+});
+
+await test("capture_permissions_are_optional_and_minimal", () => {
+  assert.deepEqual(sw.CAPTURE_PERMISSIONS.permissions, ["downloads", "webRequest"]);
+  assert.deepEqual(manifest.optional_permissions, ["downloads", "webRequest"]);
+  assert.ok(!manifest.permissions.includes("downloads"));
+  assert.ok(!JSON.stringify(manifest).includes("cookies"));
+});
+
+await test("open_desktop_settings_from_popup", async () => {
+  nativeImpl = async () => ({ ok: true, status: "ok" });
+  await sw.handlePopupMessage({ type: "openSettings" });
+  assert.equal(calls.native[0].msg.action, "open_app");
+  assert.equal(calls.native[0].msg.page, "settings");
+});
+
+await test("capture_state_when_app_unreachable", async () => {
+  nativeImpl = async () => ({ ok: false, error_code: "app_not_running", message: "My Download Manager is not running." });
+  const st = await sw.handlePopupMessage({ type: "getCaptureState" });
+  assert.equal(st.ok, false);
+  assert.equal(st.mode, "disabled");
+  assert.equal(st.connection_status, "app_not_running");
+  assert.match(st.message, /not running/);
+});
+
+// Stage 6B capture state-machine tests (mocked downloads API, desktop app and clock).
+await import("./capture_tests.mjs");
+// Stage 6B repair: PDF and image capture.
+await import("./capture_pdf_image_tests.mjs");

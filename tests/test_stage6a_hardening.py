@@ -689,8 +689,11 @@ class SchemaMigrationTests(unittest.TestCase):
         self.make_stage5_db()
         db = DatabaseManager(self.path)
         conn = db.get_connection()
-        self.assertEqual(CURRENT_SCHEMA_VERSION, 3)
-        self.assertEqual(conn.execute("PRAGMA user_version;").fetchone()[0], 3)
+        # Stage 6B evolution: v2 now migrates through v3 to the current version (v4);
+        # the v3 browser_requests checks below are unchanged. Exact v4 checks live
+        # in tests/test_stage6b_capture.py (SchemaV4MigrationTests).
+        self.assertGreaterEqual(CURRENT_SCHEMA_VERSION, 3)
+        self.assertEqual(conn.execute("PRAGMA user_version;").fetchone()[0], CURRENT_SCHEMA_VERSION)
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(browser_requests);")}
         self.assertEqual(cols, {"request_id", "download_id", "browser", "url_sha256", "status", "created_at"})
         pk = [r["name"] for r in conn.execute("PRAGMA table_info(browser_requests);") if r["pk"]]

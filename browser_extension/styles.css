@@ -133,3 +133,14 @@ body.doc { padding: 32px 20px 48px; }
 .doc code { padding: 1px 5px; }
 .doc pre { padding: 10px 12px; overflow-x: auto; margin: 8px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; }
 .doc .ext-id { font-size: 13px; color: #93c5fd; }
+
+/* Stage 6B: automatic capture */
+.select { margin-top: 4px; cursor: pointer; }
+.select:disabled { opacity: 0.5; cursor: not-allowed; }
+.capture-status { margin: 8px 0 0; }
+.note { margin: 8px 0 0; padding: 8px 10px; border-radius: var(--radius-sm); background: var(--accent-soft); color: #bfdbfe; }
+#fallback-list:not(:empty) { margin-top: 8px; }
+#settings-btn { margin-top: 10px; }
+.diag { margin-top: 10px; }
+.diag summary { cursor: pointer; overflow-wrap: anywhere; }
+.diag-list { margin: 6px 0 0; padding-left: 16px; display: flex; flex-direction: column; gap: 4px; overflow-wrap: anywhere; }

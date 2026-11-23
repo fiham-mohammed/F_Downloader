@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QGridLayout, QStackedWidget, QTableWidget,
     QTableWidgetItem, QHeaderView, QDialog, QFormLayout, QFileDialog,
     QSpinBox, QMessageBox, QAbstractItemView, QProgressBar, QMenu,
-    QProgressDialog, QComboBox, QCheckBox, QDateTimeEdit
+    QProgressDialog, QComboBox, QCheckBox, QDateTimeEdit, QScrollArea
 )
 
 from mdm.queue_manager import QueueManager
@@ -604,6 +604,7 @@ class MainWindow(QMainWindow):
             app_settings.bind_database(self.queue_mgr.db)
         self.current_filter = "All Downloads"
         self.browser_integration = None  # Stage 6A, attached by app.py
+        self.browser_capture_panel = None  # Stage 6B settings panel
         self.nav_buttons = {}
         self._item_row_map = {}  # item_id -> row
 
@@ -980,6 +981,11 @@ class MainWindow(QMainWindow):
         retry_layout.addLayout(r_form)
         layout.addWidget(retry_box)
 
+        # Stage 6B: the Browser Integration panel is inserted here when a
+        # browser integration service is attached (see attach_browser_integration).
+        self._settings_layout = layout
+        self._browser_settings_index = layout.count()
+
         # Stage 5 Information Panel
         info = QFrame()
         info.setObjectName("Panel")
@@ -1001,7 +1007,13 @@ class MainWindow(QMainWindow):
         info_layout.addWidget(description)
         layout.addWidget(info)
         layout.addStretch()
-        return page
+
+        # Stage 6B: the settings page grew, so it scrolls (content unchanged).
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setWidget(page)
+        return scroll
 
     def _on_max_simul_changed(self, val: int):
         set_max_simultaneous_downloads(val)
@@ -1082,6 +1094,11 @@ class MainWindow(QMainWindow):
         """
         self.browser_integration = service
         service.download_received.connect(self._on_browser_download_received)
+        capture = getattr(service, "capture", None)
+        if capture is not None and getattr(self, "browser_capture_panel", None) is None:
+            from mdm.browser_integration.settings_widget import BrowserCaptureSettingsPanel
+            self.browser_capture_panel = BrowserCaptureSettingsPanel(capture)
+            self._settings_layout.insertWidget(self._browser_settings_index, self.browser_capture_panel)
         self.update_browser_status()
 
     def update_browser_status(self) -> None:
@@ -1104,8 +1121,14 @@ class MainWindow(QMainWindow):
         self.browser_status_label.setVisible(True)
         QTimer.singleShot(6000, self, self.update_browser_status)
 
-    def bring_to_front(self) -> None:
-        """Shows and focuses the main window (requested from the browser popup)."""
+    def bring_to_front(self, page: Optional[str] = None) -> None:
+        """Shows and focuses the main window (requested from the browser popup).
+        ``page="settings"`` opens the Settings page (Browser Integration section)."""
+        if page == "settings":
+            self.navigate("Settings")
+            panel = getattr(self, "browser_capture_panel", None)
+            if panel is not None:
+                self.settings_page.ensureWidgetVisible(panel)
         if self.isMinimized():
             self.showNormal()
         else:

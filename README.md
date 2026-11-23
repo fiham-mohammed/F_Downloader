@@ -1,4 +1,4 @@
-# My Download Manager — Stage 6A: Chrome & Edge Browser Integration
+# My Download Manager — Stage 6B: Automatic Browser Download Capture
 
 A modern, high-performance Windows desktop download manager built with Python 3.12/3.13, PySide6, HTTPX, and SQLite.
 
@@ -13,7 +13,9 @@ Stage 5 delivers advanced download control capabilities on top of the approved S
 
 **Stage 6A** adds Chrome and Microsoft Edge integration: a Manifest V3 extension with a *Download with My Download Manager* link context menu and a popup, a standard-library Native Messaging host, and an authenticated localhost IPC service that feeds the **existing** `QueueManager`. See [Browser Integration (Stage 6A)](#browser-integration-stage-6a).
 
-The application passes **339 automated Python tests**: the 204 Stage 1–5 regression tests (Stage 2: 27, Stage 3: 33, Stage 4: 47, Stage 5: 97) plus 135 Stage 6A browser-integration tests. A further 21 extension behaviour tests run under `node --test`.
+**Stage 6B** adds opt-in **automatic capture** of downloads started in Chrome and Edge (*Off*, *Ask before downloading* or *Automatic*), with a safe two-phase handoff, file-type filters, website exclusions and a browser fallback for downloads that need your sign-in. See [Automatic Download Capture (Stage 6B)](#automatic-download-capture-stage-6b).
+
+The application passes **398 automated Python tests**: the 204 Stage 1–5 regression tests (Stage 2: 27, Stage 3: 33, Stage 4: 47, Stage 5: 97), 135 Stage 6A tests and 59 Stage 6B tests. A further **72 JavaScript tests** (21 Stage 6A + 51 Stage 6B) run under `node --test`.
 
 ---
 
@@ -108,7 +110,12 @@ MyDownloadManager/
 │       ├── ipc_protocol.py     # Length-prefixed JSON protocol, endpoint file, blocking client (stdlib only)
 │       ├── request_validator.py# URL / filename / metadata validation (stdlib only, shared with host)
 │       ├── ipc_server.py       # QTcpServer on 127.0.0.1, token auth, dedupe, timeouts (Qt main thread)
-│       └── service.py          # Bridges validated requests to QueueManager.add_download()
+│       ├── service.py          # Bridges validated requests to QueueManager.add_download()
+│       ├── capture.py          # 6B: two-phase capture state machine + cookie-less preflight probe
+│       ├── capture_rules.py    # 6B: extension filter, website exclusions, persisted capture config
+│       ├── capture_dialog.py   # 6B: non-blocking "Ask before downloading" dialog
+│       ├── settings_widget.py  # 6B: Settings › Browser Integration panel
+│       └── host_registration.py# 6B: reads the HKCU native-host registration (status only)
 │
 ├── browser_extension/          # Chrome + Edge Manifest V3 extension (load unpacked)
 │   ├── manifest.json
@@ -117,6 +124,8 @@ MyDownloadManager/
 │   ├── styles.css
 │   ├── instructions.html/.js   # In-extension setup guide (shows the extension ID)
 │   ├── lib/validation.js       # Shared URL validation and status mapping
+│   ├── lib/capture.js          # 6B: browser-side capture state machine (injected APIs)
+│   ├── lib/capture_rules.js    # 6B: extension/website rules (mirror of capture_rules.py)
 │   └── icons/                  # 16/32/48/128 px PNG icons
 │
 ├── native_host/                # Native Messaging host: com.mydownloadmanager.native
@@ -141,6 +150,9 @@ MyDownloadManager/
     ├── test_stage6a_ipc_integration.py # Stage 6A IPC security + QueueManager/UI integration (37 tests)
     ├── test_stage6a_extension.py       # Stage 6A MV3 manifest, extension behaviour, host exe (20 tests)
     ├── test_stage6a_hardening.py       # Stage 6A bounded IPC memory, durable idempotency, schema v3 (37 tests)
+    ├── test_stage6b_capture.py         # Stage 6B rules, schema v4, handshake, recovery, UI, host (45 tests)
+    ├── test_stage6b_integration.py     # Stage 6B end-to-end against a local HTTP server (14 tests)
+    ├── js/capture_tests.mjs            # Stage 6B capture state-machine tests (imported by extension_tests.mjs)
     └── js/extension_tests.mjs          # Node.js harness with a mocked chrome.* API
 ```
 
@@ -164,7 +176,7 @@ python app.py
 
 ## Running the Automated Test Suite
 
-The automated test suite contains **339 automated Python tests** plus 21 Node.js extension tests. Stage 1–5 tests are socket-free via `httpx.MockTransport`; Stage 6A tests use loopback sockets and mock IPC services only (no public websites):
+The automated test suite contains **426 automated Python tests** plus **111 Node.js extension tests**. Stage 1–5 tests are socket-free via `httpx.MockTransport`; Stage 6A tests use loopback sockets and mock IPC services only (no public websites):
 
 ```powershell
 python -m compileall -q .
@@ -174,8 +186,9 @@ node --test tests/js/extension_tests.mjs
 
 Stage 6A extension behaviour tests require Node.js 18+ on `PATH` (skipped otherwise). The built-executable test runs only after `native_host\build_host.ps1` has produced `native_host\dist\MyDownloadManagerNativeHost.exe` (skipped otherwise).
 
-### Test Suite Breakdown (339 Python tests total):
+### Test Suite Breakdown (426 Python tests total):
 
+- **Stage 6B (87 tests):** `test_stage6b_capture.py` (45), `test_stage6b_integration.py` (14), `test_stage6b_pdf_image.py` (28) — see [Stage 6B tests](#stage-6b-tests). JavaScript: 90 Stage 6B tests in `tests/js/extension_tests.mjs`, `tests/js/capture_tests.mjs` and `tests/js/capture_pdf_image_tests.mjs`.
 - **Stage 6A (135 tests):** `test_stage6a_native_messaging.py` (41), `test_stage6a_ipc_integration.py` (37), `test_stage6a_extension.py` (20), `test_stage6a_hardening.py` (37) — see [Browser Integration › Automated tests](#automated-tests).
 
 
@@ -293,7 +306,7 @@ Stage 6A extension behaviour tests require Node.js 18+ on `PATH` (skipped otherw
 
 Stage 6A lets you send HTTP/HTTPS links from **Google Chrome** and **Microsoft Edge** to My Download Manager. One Manifest V3 extension works in both browsers.
 
-> **Scope:** Stage 6A covers **manual capture only**: the right-click menu and the popup's URL box. The browser's own downloads are **not** intercepted. Automatic capture is planned for Stage 6B, with explicit user consent.
+> **Scope:** this section covers the Stage 6A foundation: the right-click menu, the popup's URL box, the native host and the secure IPC. **Automatic capture** of the browser's own downloads is Stage 6B, off by default and enabled only by you; see [Automatic Download Capture (Stage 6B)](#automatic-download-capture-stage-6b).
 
 ### Architecture
 
@@ -511,7 +524,7 @@ CREATE INDEX idx_browser_requests_created ON browser_requests(created_at);
 
 ### Known limitations
 
-* **No automatic capture:** Stage 6A doesn't intercept the browser's own downloads. That is Stage 6B.
+* **Automatic capture is Stage 6B:** it is opt-in and documented in its own section below.
 * **No browser session:** cookies and auth are not forwarded, so links that need a logged-in session (and some signed or one-time links) may fail with 401/403 or download an HTML login page. This is by design.
 * **Metadata isn't persisted:** referrer and page title are kept on the in-memory queue item (shown in **Details**) and are not saved to SQLite. Only the source browser is stored durably, in `browser_requests`. The referrer isn't sent as an HTTP `Referer` header.
 * **Idempotency window:** duplicate detection lasts for the 30-day retention window. A request ID retried after its record has been purged would be treated as new; in practice the extension keeps at most 20 pending requests, and only until they are delivered or dismissed.
@@ -530,3 +543,325 @@ CREATE INDEX idx_browser_requests_created ON browser_requests(created_at);
 | `test_stage6a_ipc_integration.py` (37) | Valid, missing and wrong token; constant-time compare; schema, version, stale-timestamp and action rejection; malformed and oversized frames; fragmented requests; sequential and concurrent duplicate `request_id`s; failed requests not cached; handler on main thread; socket timeout; connection limit; localhost-only binding; endpoint contents and token rotation; token never logged; shutdown removes endpoint and closes port; shutdown during an in-flight request; stale-endpoint replacement; no hijacking of a live instance; **real QueueManager**: valid URL queued and persisted, invalid rejected, app-side re-validation, existing filename sanitisation, queue settings preserved, no duplicates, metadata preserved, UI-thread safety, queue rejection, ping/show window, app unavailable; **MainWindow**: item appears in table, status indicator, close cleans up, vetoed close resumes integration |
 | `test_stage6a_extension.py` (20) | MV3 validity, minimal permissions, referenced files and icon sizes, CSP-safe pages, no `eval`/remote code, link-only context menu, no download interception, host manifest template, HKCU-only scripts with ID validation; Node-driven behaviour tests (`tests/js/extension_tests.mjs`): popup URL validation, context-menu creation and click, host failure handling, acknowledgements, retry with the same `request_id`, Chrome and Edge detection, sender checks, `request_id_conflict` not retried, signed URL forwarded intact; host end-to-end from source and from the built `.exe`. The same Node cases run standalone with `node --test tests/js/extension_tests.mjs` (21 tests); a failed assertion exits non-zero. |
 | `test_stage6a_hardening.py` (37) | **Bounded IPC memory:** `BoundedFrameReader` (1-byte fragments, header-time oversize rejection, zero length, never over-reads, exact 1 MB); socket read buffer capped at 64 KB; valid 1 MB message; oversized header rejected promptly without a body; oversized header in fragments; 3 MB stream after a 1 MB header never buffered; incomplete large body and incomplete header time out; zero-length frame; 10 simultaneous oversized connections; 4 concurrent 3 MB streams stay within the per-connection bound; valid 1-byte-fragmented message; trailing bytes ignored. **Durable idempotency:** first request recorded (fingerprint only); signed URL kept intact in the queue but never stored in `browser_requests` or logged; duplicate returns the original ID through SQLite; duplicate after restart; same ID with a different URL (also after restart); concurrent duplicates at the database, service and socket level; transaction failure rolls back the download and a retry succeeds; integrity failure rollback; lookup failure refuses the request; retention by age and row cap; retention on start; download history preserved; in-memory fallback. **Migration:** genuine Stage 5 (v2) database with history, segments and settings migrates to v3 unchanged; fresh database is v3. **Docs:** cookie vs. signed-URL distinction present. |
+
+---
+
+## Automatic Download Capture (Stage 6B)
+
+With automatic capture, a download started normally in Chrome or Edge (clicking a link, a "Download" button, and so on) can be handed to My Download Manager. It is **off by default** and only you can turn it on.
+
+> **Important:** My Download Manager downloads **without your browser's cookies, sign-in or other session state**. Downloads that need you to be signed in to the website are detected before the browser download is cancelled and **stay in the browser**. Browser-native authenticated downloads may need to remain in the browser; this is deliberate, not a bug.
+
+### Capture modes
+
+| Mode | What happens when the browser starts an eligible download |
+|---|---|
+| **Off** *(default)* | Nothing. Downloads stay in the browser. The right-click menu and the popup's URL box still work. |
+| **Ask before downloading** | The browser download is paused and My Download Manager shows a dialog with the file name, website and size, plus two buttons: **Download with My Download Manager** or **Continue with browser download**. If you don't answer within 120 s, or you close the dialog, the browser download continues. |
+| **Automatic** | The download is handed over without a dialog, once My Download Manager has checked it can fetch the file and has durably accepted it. |
+
+You can switch modes in the extension popup (*Automatic capture*) or in My Download Manager under **Settings › Browser Integration**. Both change the same setting, which the desktop app stores in its SQLite `settings` table.
+
+### How the handoff works
+
+The browser starts transferring **before** any extension is told about a download, so the download cannot be intercepted beforehand. Instead, capture is a two-phase handshake in which the browser download is cancelled only **after** My Download Manager has accepted it:
+
+```text
+Browser (extension)                                   My Download Manager
+───────────────────                                   ───────────────────
+download created → quick checks (mode, scheme,
+  incognito, danger, own download, excluded site,
+  file type, request method)
+pause the browser download
+collect the file name + confirm it was a plain GET
+prepare_capture ─────────────────────────────────────► validate, check rules again
+                                                       record in SQLite (state: probing)
+                                                       cookie-less 1-byte probe (worker thread)
+                                                         401/403/login page → declined (auth_required)
+                                                         ok + Automatic     → approved
+                                                         ok + Ask           → dialog → approved / declined
+capture_status (poll every 1.5 s) ◄──────────────────── probing | awaiting_user | approved | declined
+approved:  cancel the browser download,
+           confirm it is cancelled
+commit_capture (request ID + URL) ───────────────────► ONE SQLite transaction:
+                                                         download row + browser_requests row
+                                                         + capture approved → committed
+                                                       existing QueueManager starts the download
+otherwise: abort_capture + resume the browser download
+```
+
+* **Nothing is lost:**
+  * If the app is closed or unreachable, times out, declines, or the probe fails, the browser download is **resumed**.
+  * If cancelling fails, or the download finished first, the capture is **aborted** and no second download starts.
+  * If the commit fails after the browser download was cancelled, the extension retries. If the capture can no longer be committed, the browser **re-downloads the file itself** (with its own cookies). That re-download is never captured again.
+* **Restart-safe:**
+  * Capture records are persisted in `chrome.storage.local` / `chrome.storage.session` and in SQLite.
+  * When the browser restarts the extension's service worker, it continues or safely unwinds every capture that was in flight. A download paused by a stopped worker is resumed.
+  * When My Download Manager restarts, approved captures can still be committed. Captures that were still being probed or waiting for your answer expire, and the browser resumes them.
+* **No duplicates:** every step is idempotent. The capture's request ID is the primary key in both `browser_captures` and the Stage 6A `browser_requests` table. Repeated events, polls, commits or concurrent requests never create a second queue entry.
+
+### Which downloads are captured
+
+A download is captured only if **all** of these are true:
+
+* capture is enabled (Ask or Automatic), the desktop app is reachable, and the extension has its optional permissions
+* the URL is `http:` or `https:`, so never `blob:`, `data:`, `file:`, `javascript:`, `about:`, `chrome:`, `edge:` or extension URLs, and has no embedded `user:password@`
+* it is not a private-window (incognito) download
+* the browser marks it **safe**: anything with a danger flag stays in the browser, as does any download that gets flagged while it is paused
+* it was not started by this extension (its own fallback downloads) or by another extension. The only exception is the browser's own built-in PDF viewer (component extension `mhjfbmdgcfjbbpaeojofohoefgiehjai` in Chrome and Edge), and only for a PDF over http(s): if a browser reports the viewer as the initiator of its Download button, that is still your download. Every other extension's downloads stay excluded.
+* the browser's request was observed and every hop was a **GET**. POST/PUT form submissions, and downloads whose method can't be confirmed (including an event with a missing or malformed method), are never touched or replayed, and request bodies are never collected. For a PDF or image that the browser displayed and then saves from its cache (PDF viewer Download button, *Save image as…*), the GET that displayed that exact URL counts, for up to 30 minutes, and only if the saved file is the same kind (PDF/image).
+* its file type is selected and neither the file's website nor the page it was started from is excluded
+* My Download Manager's cookie-less probe gets the file (not an error and not a login page)
+
+### File-extension settings
+
+Selected by default:
+
+| Group | Extensions |
+|---|---|
+| Archives | zip, rar, 7z, tar, gz |
+| Executables | exe, msi, msix |
+| Disk images | iso, img |
+| Video | mp4, mkv, avi, mov, wmv, webm |
+| Audio | mp3, wav, flac, aac |
+| Documents | pdf, doc, docx, xls, xlsx, ppt, pptx |
+| Images | jpg, jpeg, png, gif, webp, bmp, tif, tiff, ico |
+| Other | apk, csv, txt |
+
+The **Images** group was added by the Stage 6B repair (capture configuration v2). New installations get it enabled. Existing configurations are upgraded without touching anything you saved: your on/off choices, custom extensions, excluded sites and mode stay as they were, and only the image extensions, which did not exist before, start enabled. A custom extension that is now built in (for example a custom `webp`) becomes the built-in checkbox, still enabled. Untick the image types in **Settings › Browser Integration** if you prefer images to stay in the browser.
+
+* Each one can be switched off individually in **Settings › Browser Integration**.
+* Custom extensions can be added and removed. They are normalised to lowercase, accept `.ZIP`, `*.epub` and two-part types such as `tar.gz`, and anything else is rejected (letters and digits only).
+* Matching uses the longest suffix, so `archive.tar.gz` matches `tar.gz` before `gz`. A file without an extension is not captured.
+* The file name is taken from the browser first, which already applies `Content-Disposition`. Next comes the server's `Content-Disposition` (observed by the extension, or read by the desktop probe), then the URL **path**. The query string is never inspected or modified, so signed URL parameters are left intact.
+
+### Website exclusions
+
+* Add or remove websites in **Settings › Browser Integration**. Downloads from them always stay in the browser.
+* Entries are normalised: lowercase, `https://…/path` is reduced to the host, a leading `*.` is dropped, and internationalised names are converted to punycode (`bücher.example` → `xn--bcher-kva.example`).
+* Other wildcards, bare top-level domains (`com`) and malformed names are rejected.
+* An exclusion covers the site **and its subdomains**, matched on label boundaries. `example.com` excludes `example.com` and `dl.example.com`, but **not** `notexample.com` or `example.com.evil.net`.
+* The download's own host and the referring page's host are both checked, so excluding `youtube.com` also covers files served from other domains for a YouTube page.
+
+### Browser permissions
+
+The required permissions are unchanged from Stage 6A (`contextMenus`, `nativeMessaging`, `storage`, `notifications`). Automatic capture adds **optional** permissions, which the browser asks you for only when you select *Ask* or *Automatic* in the popup:
+
+| Permission | Why |
+|---|---|
+| `downloads` | Pause, resume and cancel a browser download during the handoff, and restart one in the browser as a fallback |
+| `webRequest` + `http://*/*`, `https://*/*` | Observe-only (`onHeadersReceived` and, for responses served from the HTTP cache, `onResponseStarted`; never blocking): read the **request method**, status, resource type (`main_frame`, `sub_frame`, `other`, `image`) and the `Content-Type` / `Content-Disposition` headers, to confirm a download was a plain GET and get its file name. Nothing is blocked or modified. Observations stay in memory for two minutes (30 for a GET that displayed a PDF or an image). So that a restarted service worker can still confirm a GET, a copy is kept in `chrome.storage.session` (memory only, cleared when the browser closes) keyed by the **SHA-256 of the URL**; the URL, its query string and header values are never stored there. Nothing is sent anywhere. |
+
+The extension never requests cookies, tabs, history, browsing data or anything password-related. Choosing **Off** in the popup removes the optional permissions again. If you decline the browser's prompt, capture stays off and downloads behave normally.
+
+### Chrome installation
+
+1. Rebuild and re-register the native host. The installed copy must be updated for Stage 6B, because it contains the new capture actions:
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File .\native_host\build_host.ps1
+   powershell -ExecutionPolicy Bypass -File .\native_host\install_native_host.ps1 -ChromeExtensionId <CHROME_ID>
+   ```
+   Close Chrome completely first if the installer reports that the host file is in use.
+2. Open `chrome://extensions` and click **Reload** on *My Download Manager* (the extension is now version 0.7.0). The ID does not change when you reload from the same folder.
+3. Restart Chrome, start My Download Manager (`python app.py`), open the popup and choose **Ask before downloading** or **Automatic**. Accept the permission prompt.
+
+### Edge installation
+
+Same as Chrome, using `edge://extensions` and `-EdgeExtensionId <EDGE_ID>`. Both IDs can be given in one installer command.
+
+### Native host registration
+
+The registration is unchanged from Stage 6A; see [Native host registration details](#native-host-registration-details). **Settings › Browser Integration** shows, for each browser, whether the host is registered (read from HKCU, read-only), when the extension last contacted the app, and whether capture permissions are granted. **Test connection** runs the registered host exactly as the browser does and pings the app through it, without blocking the window.
+
+### Authentication limitations and browser fallback
+
+* Python's HTTP client **does not and cannot** use Chrome's or Edge's cookies, saved passwords, client certificates or other session state. The extension never reads them.
+* Before a capture is accepted, the desktop app makes a single cookie-less request for one byte (`Range: bytes=0-0`, TLS certificates always verified). If that returns 401/403/407, an error, or a web page where the browser received a file (typically a login page), the capture is declined and the **original browser download is resumed**. You get a notification explaining why.
+* If a captured download later fails with HTTP 401/403/407 (for example a session that expired between probe and download), the popup lists it under *Needs your browser session*. **Download in browser** asks the browser to download the same URL itself, with your session, using the Chrome/Edge downloads API. Cookies still never leave the browser. That browser download is not captured again.
+* **Single-use links** (some CDN links expire after the first request) cannot be captured reliably, because the browser's own request, the probe and the engine's requests each count as a use. Add such sites to the exclusions.
+* Browser **Safe Browsing scans** that complete *after* a download has been handed over cannot be applied to the copy downloaded by My Download Manager. Downloads the browser has already flagged are never captured.
+
+### Troubleshooting (automatic capture)
+
+| Symptom | Fix |
+|---|---|
+| Nothing is captured | Check the popup: the mode must be *Ask* or *Automatic*, with no "permissions not granted" warning. Check that the file type is selected and the site isn't excluded. Make sure the download is a normal link (not a form POST) in a normal window (not private). |
+| Popup says the native host doesn't understand capture | The installed host is the Stage 6A copy. Re-run `build_host.ps1`, then `install_native_host.ps1`. |
+| Download always "continues in the browser" with a sign-in notice | The site needs your session (cookies). Expected; see the authentication limitations above. |
+| The Ask dialog doesn't appear | My Download Manager must be running. The dialog stays on top. Unanswered dialogs continue in the browser after 120 s. |
+| Download briefly pauses, then continues in the browser | The extension couldn't confirm it was a plain GET or couldn't determine its file type within 2 s. It is left alone on purpose. |
+| Settings status shows "no contact" | Open the extension popup once. The status refreshes every 10 s. |
+| A PDF opens in the browser instead of being captured | Expected: displaying a PDF is not a download (see [PDF and image capture](#pdf-and-image-capture)). Click the viewer's Download button, or right-click the link › *Download with My Download Manager*. |
+| A small image or PDF still lands in the browser's downloads | Check **Last capture decision** (popup or Settings). `completed_before_pause` means the browser finished the file before it could be paused; the file is complete, so nothing is lost or duplicated. |
+| Unsure why a download was not captured | The popup's *Last capture decision* and **Settings › Browser Integration › Last capture decision** show the exact reason (for example `method_unknown`, `extension_not_selected`, `other_extension`, `auth_required`). |
+
+### PDF and image capture
+
+PDFs and images reach the browser in more ways than ordinary downloads, and not all of them are downloads at all.
+
+| How the file arrives | What the browser does | Captured automatically? |
+|---|---|---|
+| **A. Direct PDF attachment**: the server sends `Content-Disposition: attachment`, or the link has a `download` attribute | Creates a normal download item (HTTP/HTTPS GET) | **Yes**, in Ask and Automatic mode: pause → validate → desktop preflight → two-phase handshake → queue |
+| **B. PDF opened in the browser's PDF viewer**: a plain link to a PDF served `inline` | Navigates the tab and *displays* the PDF. **No download item exists**, so `downloads.onCreated` never fires | **No, by design**: normal PDF viewing is preserved. Right-click the link › *Download with My Download Manager* |
+| **C. The viewer's Download button** (after B) | Creates a download item for the same http(s) URL, usually served from the browser cache, so it never reaches `onHeadersReceived` | **Yes**: the GET is confirmed by the response that displayed the PDF (or by `onResponseStarted`) |
+| C with an edited/annotated PDF, or a PDF generated by a page script | Saves a `blob:`/`data:` URL or uses the file-save dialog | **No**: there is no URL My Download Manager could fetch; the browser keeps it |
+| **Image link / `download` attribute / image attachment** | Creates a download item | **Yes** (jpg, jpeg, png, gif, webp, bmp, tif, tiff, ico) |
+| **Right-click an image › Save image as…** | Creates a download item served from the cache | **Yes**: the GET is confirmed by the `image` request that displayed it |
+| An image merely displayed on a page | Nothing to download | No |
+
+#### Why case B is not intercepted
+
+Opening a PDF in a tab is a navigation, not a download. A Manifest V3 extension can only *observe* it (`webRequest` here is observe-only). Stopping it would need blocking interception: a script injected into every page to rewrite link clicks, or a `declarativeNetRequest` redirect. Either way the extension would guess from the link text before the server has said what the file is, and could silently break normal viewing, inline previews and sites that embed PDFs. That would also need new permissions. So it is **not implemented**: PDFs you open are viewed as before, and you hand them over explicitly with the viewer's Download button or the right-click menu. If automatic link interception is ever added, it must be a separate, opt-in setting that only acts on a trusted user click on an http(s) GET link.
+
+#### Filename and type detection
+
+Priority: (1) the name the browser resolved (it already honours `Content-Disposition`), (2) the server's `Content-Disposition` (`filename*=` UTF-8 preferred; quoted, escaped, unquoted-with-spaces and raw UTF-8 names are handled; any path is stripped), (3) the URL **path** of the final URL, then of the original URL. Extensions are case-insensitive (`report.PDF`). The query string is never read for a name, so `report.pdf?name=evil.exe` is a PDF, and signed URLs are forwarded byte-for-byte. If there is still no extension and the MIME type is unambiguous (`application/pdf`, `image/jpeg`, `image/png`, `image/gif`, `image/webp`, `image/bmp`, `image/tiff`, `image/x-icon`), the matching extension is appended (`export` → `export.pdf`). Ambiguous types such as `application/octet-stream` are never guessed.
+
+#### Capture diagnostics
+
+Every decision is recorded without any URL, query string, header value, cookie or token. The record holds:
+
+* browser download ID, browser and resource type
+* HTTP method, and where it was confirmed (memory or session) and whether it came from the cache
+* filename, extension and MIME type
+* download state, whether it was paused, and whether an extension initiated it (and which kind: this extension, the browser PDF viewer, or another extension)
+* mode, decision, and the exact skip or failure reason
+
+The extension popup shows the latest decision and the last 10 (bounded history of 25 in `chrome.storage.session`, cleared when the browser closes). Decisions for downloads that could have been captured (capture on) are also reported to the desktop app. **Settings › Browser Integration** shows them under *Last capture decision*, keeping the last 50 in memory only. Each report is validated against a strict allowlist (no URL field exists; URL- or path-like filenames are dropped).
+
+Common reasons: `extension_not_selected`, `method_unknown` (method missing or not provable), `unsupported_method` (POST/PUT…), `other_extension`, `unsupported_url` (blob/data/file…), `incognito`, `dangerous`, `site_excluded`, `completed_before_pause` (the file finished before it could be paused), `auth_required` / `html_response` (needs your browser session), `app_unavailable`, `user_declined`, `committed`.
+
+### Manual testing guide (PDF and images)
+
+**Preparation (once):**
+
+1. Rebuild and re-register the native host, because it now also forwards `report_capture_decision`. Then reload the extension. See [Rebuilding and reloading](#rebuilding-and-reloading-after-the-pdfimage-repair) below.
+2. Start My Download Manager: `.venv\Scripts\python app.py`
+3. Start the local test page: `.venv\Scripts\python tools\capture_test_server.py`, then open **http://127.0.0.1:8765/** in Chrome. Files are sent slowly on purpose, so downloads stay in progress long enough to be paused.
+4. In the extension popup choose **Automatic** (accept the permission prompt), unless a step says otherwise.
+
+After every step, open the popup and expand **Last capture decision**, or look at **Settings › Browser Integration › Last capture decision**.
+
+#### Direct PDF download
+
+1. Click **report.pdf (Case A)**. Expected: the browser download appears briefly, is cancelled, and *report.pdf* is added to My Download Manager. The decision reads `committed`, `GET`, `main_frame` or `other`, `application/pdf`.
+2. Repeat with **REPORT-UPPER.PDF**, **/get?id=7** (saved as *Quarterly report été.pdf*), the **signed** link (saved as *report.pdf*, never *x.exe*) and the **redirect** link. Each is captured.
+
+#### PDF opened in Chrome
+
+1. Click **manual.pdf (Case B)**. Expected: the PDF **opens in the browser's viewer** and nothing is captured. No new decision is recorded, because no download happened.
+2. Go back, right-click the same link › **Download with My Download Manager**. Expected: it is added (the Stage 6A manual path).
+
+#### PDF viewer Download button
+
+1. Open **manual.pdf** again and wait a minute or two. Then click the viewer's **Download** (arrow) button and pick *Original* if asked.
+2. Expected: captured (`committed`). The decision shows `method_source` memory or session and usually `from_cache`. If the browser reports its PDF viewer as initiator, the decision says *started by browser pdf viewer*.
+3. Draw on the PDF (if your viewer allows it) and download the edited copy. Expected: it stays in the browser with `unsupported_url`, because edited copies are `blob:` data.
+
+#### JPG download
+
+1. Click **photo.jpg (download attribute)**. Expected: captured as *photo.jpg* (`image/jpeg`).
+2. Right-click the JPG image on the page › **Save image as…** › Save. Expected: captured. *Save image as* is served from the cache and confirmed by the `image` request that displayed it.
+3. Click **attachment.jpg**. Expected: captured as *holiday photo.jpg*.
+
+#### PNG download
+
+1. Click **photo.png (download attribute)**, then right-click the PNG image › **Save image as…**. Both are captured as *photo.png*.
+2. Optional: **photo.webp** and **photo.bmp** are captured too. In **Settings › Browser Integration** untick *png* and repeat. Expected: it stays in the browser with `extension_not_selected`, without being paused.
+
+#### Ask mode
+
+1. In the popup choose **Ask before downloading**.
+2. Click **report.pdf**. Expected: the browser download pauses and a My Download Manager dialog asks. **Download with My Download Manager** captures it. **Continue in browser** resumes the browser download (`user_declined`). Not answering for 120 s continues in the browser (`timeout`).
+
+#### Automatic mode
+
+With **Automatic** selected, steps A, C, JPG and PNG above complete without any dialog. Then:
+
+* Click the **POST form** button. Expected: it stays in the browser and is never paused (`unsupported_method`).
+* Open the test page in an **InPrivate/Incognito** window and click report.pdf. Expected: it stays in the browser (`incognito`).
+
+#### Browser fallback
+
+1. Click **payslip.pdf (needs the browser session)**. The page set a cookie that only the browser has. Expected: the download pauses briefly, My Download Manager's cookie-less probe gets HTTP 401, and the browser download **resumes** with a "needs your browser session" notice (`auth_required`). Nothing is added to the queue.
+2. Close My Download Manager and click **report.pdf**. Expected: the download continues in the browser. If the extension had a recent configuration it pauses for a moment and resumes (`app_unavailable`); otherwise it is never touched.
+
+#### Edge compatibility
+
+Repeat the steps above in Microsoft Edge with the extension loaded from the same folder (`edge://extensions`, Developer mode, Load unpacked) and the host registered with `-EdgeExtensionId`. Edge's PDF viewer looks different, but cases A, B and C behave the same. Decisions report the browser as *Microsoft Edge*. Edge can also show its own download prompt or flyout. A download Edge marks as unsafe or uncommon is never captured (`dangerous`).
+
+#### Rebuilding and reloading after the PDF/image repair
+
+```powershell
+# 1. Rebuild and re-register the native host (close Chrome and Edge first if the file is in use)
+powershell -ExecutionPolicy Bypass -File .\native_host\build_host.ps1
+powershell -ExecutionPolicy Bypass -File .\native_host\install_native_host.ps1 -ChromeExtensionId <CHROME_ID> -EdgeExtensionId <EDGE_ID>
+# 2. Restart the desktop app
+.venv\Scripts\python app.py
+```
+
+3. `chrome://extensions` (or `edge://extensions`) › *My Download Manager* › **Reload**. The version stays 0.7.0 and the ID does not change.
+4. Open the popup and choose *Ask* or *Automatic* again if the permission prompt reappears. No new permissions were added: `webRequest` now also observes `image` requests and cached responses, within the same optional host access.
+
+### Database schema v4: `browser_captures`
+
+`CURRENT_SCHEMA_VERSION` goes from 3 to **4**. The migration is additive: existing downloads, segments, settings and `browser_requests` rows are untouched, and completed history is never deleted. Version 2 and 3 databases migrate automatically on first start.
+
+```sql
+CREATE TABLE browser_captures (
+    request_id          TEXT PRIMARY KEY,   -- shared with browser_requests on commit
+    browser             TEXT NOT NULL,      -- 'chrome' | 'edge'
+    browser_download_id INTEGER,            -- the browser's DownloadItem id
+    url_sha256          TEXT NOT NULL,      -- fingerprint only; the URL itself is never stored here
+    filename            TEXT,
+    total_bytes         INTEGER,
+    mode                TEXT NOT NULL,      -- 'ask' | 'automatic'
+    state               TEXT NOT NULL,      -- probing | awaiting_user | approved | declined | aborted
+                                            -- | expired | committed | needs_browser | fallback_claimed
+    reason              TEXT,               -- e.g. user_declined, auth_required, timeout
+    download_id         TEXT,               -- the queue item once committed
+    created_at TEXT NOT NULL, updated_at TEXT NOT NULL, expires_at TEXT NOT NULL
+);
+```
+
+* **Atomic commit:** the download row, the `browser_requests` dedupe row and the `approved → committed` change are one transaction. If the capture is not `approved` at that moment, for example because it was aborted concurrently, the whole transaction rolls back.
+* **Expiry and cleanup:**
+  * probing or awaiting captures expire after 10 min (2.5 min in Ask mode)
+  * approved captures expire after 24 h
+  * finished records are purged after 7 days
+  * download rows are never deleted by this policy
+* **Not stored:** URLs, cookies and request headers. The browser keeps the URL of an in-flight capture in `chrome.storage.local` until it is committed or handed back, and re-sends it with `commit_capture`, where it must match the stored fingerprint.
+
+### Stage 6B tests
+
+| Suite | Coverage |
+|---|---|
+| `tests/js/capture_tests.mjs` (46) + 5 service-worker tests in `extension_tests.mjs` | Capture disabled, enabled and Ask (accept, reject, timeout); extension filtering incl. custom and multi-part; website exclusions incl. subdomains, `notexample.com` and IDN; http/https eligibility; invalid, blob, data and file URLs; incognito; dangerous (incl. flagged while paused); own- and other-extension downloads; POST and unknown methods; redirect hops; Content-Disposition names; signed query preserved; duplicate events; duplicate and conflicting request IDs; service-worker restart (awaiting, mid-evaluation, after cancel, idempotent); permission denied; listeners registered only after grant; native host unavailable; app unavailable; IPC timeout; auth-required probe; cancellation failure or unconfirmed; completed before cancel; user resumed in browser; resume after rejection; commit fallback, retry and give-up; fallback failure and retry; auth fallback claim; Chrome and Edge; config caching. A mutation check (removing the incognito rule and committing before cancelling) makes 7 of these fail. |
+| `test_stage6b_capture.py` (45) | Rules (extensions, sites, IDN, config); v2/v3 → v4 migration with history preserved; prepare (validation, rules, idempotency, conflicts, 6A request-ID sharing); commit (approval, URL match, expiry, duplicate); abort (incl. after commit); persistent records and recovery across restart; maintenance; concurrent duplicate commit; the SQL state guard; database transaction failure; queue insertion failure; probe failures; user approval and rejection; dialog buttons, timeout and close; **GUI responsiveness** (event loop keeps running during a 1 s probe); main-thread dialogs; auth-failure fallback; config/mode over IPC; settings panel; registration parsing; MainWindow integration; native-host validation and fresh IPC IDs. |
+| `tests/js/capture_pdf_image_tests.mjs` (39) | PDF/image repair: JPG, JPEG, PNG, GIF, WEBP, BMP capture; unsupported image format; image GET observed as `image`; unknown and malformed methods; POST image; image redirect; image Content-Disposition; *Save image as* from cache (incl. the 30-min bound and non-image control); `onResponseStarted`-only cached responses; observations surviving a worker restart with no URL in storage; direct PDF; uppercase `.PDF`; signed query; PDF redirect (and a POST hop); PDF named by Content-Disposition or MIME; PDF opened in the viewer left alone; viewer Download button with and without the viewer ID; viewer ID limited to PDFs; mismatched cached type; other-extension PDF; blob/data PDFs; auth-required PDF; app closed (with and without a cached config); pause before config refresh; completed before pause; diagnostics fields, bound and privacy; regression of ZIP, EXE, Ask, Automatic, Off, exclusions, incognito, dangerous, duplicates. |
+| `test_stage6b_pdf_image.py` (28) | Image defaults and v1 → v2 upgrade preserving saved choices; Python image matching; Content-Disposition parsing; `report_capture_decision` validation (no URL possible), native-host pre-IPC rejection, bounded storage and the Settings panel's *Last capture decision*; image checkboxes; local-HTTP end-to-end captures of JPG, JPEG, PNG, GIF, WEBP and BMP to disk, unsupported HEIC, GET-only, image redirect and Content-Disposition, direct/uppercase/signed/redirected/Content-Disposition PDFs, viewer-button request, auth-required and sign-in-page PDFs, app closed, duplicate commit, decision report through the host. |
+| `test_stage6b_integration.py` (14) | Local HTTP server and the real chain to a file on disk: small direct download, 6 MB multi-connection, redirect, Content-Disposition filename, unknown size, signed URL query (byte-for-byte, never logged), unsupported methods, auth-required and login page, browser fallback after a native 403, duplicate requests, app restart between approval and commit, app unavailable, Ask accept and reject, existing manual and queue downloads unaffected. |
+
+Four Stage 6A tests encoded the *6A* scope (no optional permissions, no `downloads.onCreated`, no `chrome.downloads`, schema exactly v3). Each was updated to the equivalent Stage 6B guarantee:
+
+* required permissions are unchanged
+* optional permissions are pinned to exactly `downloads` and `webRequest`, and optional host access to http/https
+* the downloads API and its listener are confined to `service_worker.js`
+* `onDeterminingFilename` and `cookies` are still forbidden
+* capture is off by default
+* v2 migrates to the current schema
+
+For the PDF/image repair, three Stage 6B tests that used `.jpg`/`.png` as examples of a file type that is *never* selected by default now use still-unsupported formats (`.heic`, `.svg`) with the same assertions, plus a positive `.jpg` assertion. The default-extension test now expects the Images group. The service-worker listener test gained assertions for the `image` type and the observe-only `onResponseStarted` listener. No assertion was removed.
+
+### Known limitations (Stage 6B)
+
+* Only downloads whose request the extension **observed** as GET are captured. Downloads the browser starts without a visible network request (some "Save link as…" and script-initiated downloads) stay in the browser.
+* Every capture keeps the browser download **paused** for up to about 2 s while facts are collected, and in Ask mode for as long as the dialog is open (at most 120 s).
+* Each status poll starts the native host process (as with every native-messaging message), roughly 0.3–0.5 s per call with the one-file executable.
+* Session-dependent, single-use and client-certificate downloads stay in the browser (see above). POST, PUT and other form downloads are never captured.
+* The capture handoff starts a new connection from My Download Manager, so a download the browser had already partly fetched starts again from zero.
+* **PDFs opened in the browser's viewer are not captured automatically**: that is a navigation, not a download (see [PDF and image capture](#pdf-and-image-capture)). Use the viewer's Download button or the right-click menu.
+* **Edited/annotated PDFs and script-generated files** (`blob:`/`data:` URLs) always stay in the browser.
+* **Very small files** (icons, thumbnails, small PDFs on fast connections) can be finished by the browser before they can be paused. They then stay in the browser (`completed_before_pause`); they are complete, never duplicated. The pause is now issued before any native round trip when a recent configuration enabled capture, which makes this much rarer.
+* A cached PDF/image save is trusted only within 30 minutes of the GET that displayed it, and only while the service worker's session storage survives (until the browser is closed). After that it stays in the browser (`method_unknown`).
+* The browser-PDF-viewer allowlist uses the Chromium viewer's component ID. Current Chrome and Edge builds normally do not report any extension for the viewer's Download button. If a future build reports a different ID, those downloads stay in the browser (`other_extension`) until the allowlist is updated.

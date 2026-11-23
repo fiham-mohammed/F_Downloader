@@ -1,5 +1,6 @@
 // My Download Manager - popup controller (Stage 6A).
 import { validateDownloadUrl, detectBrowser, browserLabel } from "./lib/validation.js";
+import { CAPTURE_PERMISSIONS, CAPTURE_MODE_LABELS } from "./lib/capture_rules.js";
 
 const $ = (id) => document.getElementById(id);
 
@@ -157,3 +158,156 @@ $("help-btn").addEventListener("click", () => {
 chrome.action.setBadgeText({ text: "" });
 refreshStatus();
 refreshPending();
+
+// ------------------------------------------------- Stage 6B: automatic capture
+function showCaptureMessage(text, kind) {
+  const el = $("capture-message");
+  el.textContent = text;
+  el.className = `message message-${kind}`;
+  el.hidden = !text;
+}
+
+function fallbackItem(label, detail, buttonText, onClick) {
+  const li = document.createElement("li");
+  const text = document.createElement("div");
+  text.className = "pending-text";
+  const name = document.createElement("span");
+  name.className = "pending-url";
+  name.textContent = label;
+  name.title = label;
+  const why = document.createElement("span");
+  why.className = "muted small";
+  why.textContent = detail;
+  text.append(name, why);
+  const button = document.createElement("button");
+  button.className = "btn btn-secondary btn-sm";
+  button.type = "button";
+  button.textContent = buttonText;
+  button.addEventListener("click", async () => {
+    button.disabled = true;
+    await onClick();
+  });
+  li.append(text, button);
+  return li;
+}
+
+/** One line per decision; everything is rendered as plain text. */
+export function describeDecision(d) {
+  const what = d.filename || "download";
+  const outcome = d.decision === "committed" ? "sent to My Download Manager"
+    : d.decision === "browser_fallback" ? "restarted in the browser"
+      : `left in the browser (${d.reason || d.decision})`;
+  const facts = [d.method || "method ?", d.resource_type, d.mime, d.initiator !== "browser" ? d.initiator : null]
+    .filter(Boolean).join(", ");
+  return `${what}: ${outcome} [${facts}]`;
+}
+
+function renderDiagnostics(list) {
+  $("diag-details").hidden = list.length === 0;
+  $("diag-latest").textContent = list.length ? describeDecision(list[0]) : "—";
+  const ul = $("diag-list");
+  ul.replaceChildren();
+  for (const d of list) {
+    const li = document.createElement("li");
+    li.textContent = `${formatTime(d.at)} · ${describeDecision(d)}`;
+    ul.append(li);
+  }
+}
+
+async function refreshCapture() {
+  let st = null;
+  try {
+    st = await send("getCaptureState");
+  } catch (_e) {
+    st = null;
+  }
+  const select = $("capture-mode");
+  if (!st) {
+    $("capture-status").textContent = "The extension background service is not responding.";
+    select.disabled = true;
+    return;
+  }
+  select.value = st.mode;
+  select.disabled = !st.ok;
+  const label = CAPTURE_MODE_LABELS[st.mode] || "Off";
+  $("info-capture").textContent = st.ok ? label : "Unavailable";
+  $("info-pending").textContent = String(st.captures.length);
+  let status;
+  if (!st.ok) {
+    status = `${st.message} Automatic capture is inactive, so downloads stay in the browser.`;
+  } else if (st.mode === "disabled") {
+    status = "Off. Downloads stay in the browser; the right-click menu still works.";
+  } else if (!st.permissions) {
+    status = `${label} is selected in My Download Manager, but this browser has not granted the capture `
+      + "permissions. Choose the mode again to grant them.";
+  } else {
+    status = `${label}. Selected file types: ${st.extensions.length}. Excluded websites: ${st.excluded_sites.length}.`;
+  }
+  $("capture-status").textContent = status;
+  $("capture-permission-note").hidden = st.permissions;
+  renderDiagnostics(Array.isArray(st.diagnostics) ? st.diagnostics : []);
+
+  const list = $("fallback-list");
+  list.replaceChildren();
+  for (const f of st.fallbacks) {
+    list.append(fallbackItem(f.filename || "Download", "Needs your browser session (sign-in/cookies).",
+      "Download in browser", async () => {
+        const r = await send("claimFallback", { requestId: f.request_id });
+        showCaptureMessage(r.ok ? "Downloading in the browser." : (r.message || "Could not hand it back."),
+          r.ok ? "success" : "error");
+        refreshCapture();
+      }));
+  }
+  for (const c of st.captures.filter((x) => x.phase === "fallback_failed")) {
+    list.append(fallbackItem(c.filename || "Download", "Could not be restarted in the browser.",
+      "Retry in browser", async () => {
+        const r = await send("retryCaptureFallback", { requestId: c.request_id });
+        showCaptureMessage(r.ok ? "Downloading in the browser." : "Still failing; try again later.",
+          r.ok ? "success" : "error");
+        refreshCapture();
+      }));
+  }
+}
+
+$("capture-mode").addEventListener("change", async () => {
+  const mode = $("capture-mode").value;
+  if (mode !== "disabled") {
+    // Must be the first call in the user's gesture: the browser shows its own prompt.
+    let granted = false;
+    try {
+      granted = await chrome.permissions.request(CAPTURE_PERMISSIONS);
+    } catch (_e) {
+      granted = false;
+    }
+    if (!granted) {
+      showCaptureMessage("Permission was not granted, so automatic capture stays off. "
+        + "Downloads continue normally in the browser.", "error");
+      await refreshCapture();
+      return;
+    }
+  }
+  showCaptureMessage("Saving…", "info");
+  const r = await send("setCaptureMode", { mode });
+  if (r && r.ok) {
+    if (mode === "disabled") {
+      try {
+        await chrome.permissions.remove(CAPTURE_PERMISSIONS);
+      } catch (_e) {
+        // already removed
+      }
+    }
+    showCaptureMessage(mode === "disabled" ? "Automatic capture turned off."
+      : `Automatic capture: ${CAPTURE_MODE_LABELS[mode]}.`, "success");
+  } else {
+    showCaptureMessage((r && r.message) || "My Download Manager is not reachable; the setting was not changed.", "error");
+  }
+  refreshCapture();
+});
+
+$("settings-btn").addEventListener("click", async () => {
+  const r = await send("openSettings");
+  showCaptureMessage(r && r.ok ? "Opened in My Download Manager." : ((r && r.message) || "Could not open the app."),
+    r && r.ok ? "success" : "error");
+});
+
+refreshCapture();

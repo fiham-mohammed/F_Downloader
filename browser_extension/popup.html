@@ -39,6 +39,33 @@
     <p id="add-message" class="message" role="status" hidden></p>
   </section>
 
+  <!-- Stage 6B: automatic capture -->
+  <section class="card" id="capture-card">
+    <h2>Automatic capture</h2>
+    <label for="capture-mode" class="muted small">When the browser starts a download</label>
+    <select id="capture-mode" class="input select">
+      <option value="disabled">Off – keep downloads in the browser</option>
+      <option value="ask">Ask before downloading</option>
+      <option value="automatic">Automatic</option>
+    </select>
+    <p id="capture-status" class="muted small capture-status"></p>
+    <p id="capture-permission-note" class="note small" hidden>
+      Turning this on asks the browser for two extra permissions:
+      <strong>manage your downloads</strong> (to pause, hand over or resume a download) and
+      <strong>read request details on websites</strong> (only to confirm a download was a plain GET
+      request and to read its file name). The extension never reads cookies, saved passwords,
+      page content or your browsing history.
+    </p>
+    <p id="capture-message" class="message" role="status" hidden></p>
+    <ul id="fallback-list" class="pending-list"></ul>
+    <details id="diag-details" class="diag" hidden>
+      <summary class="small">Last capture decision: <span id="diag-latest">—</span></summary>
+      <p class="muted small">Recent decisions in this browser session (file names only; links are never recorded).</p>
+      <ul id="diag-list" class="diag-list small"></ul>
+    </details>
+    <button id="settings-btn" class="btn btn-ghost btn-block" type="button">Open desktop capture settings</button>
+  </section>
+
   <!-- Requests that could not be delivered (kept so nothing is silently discarded) -->
   <section id="pending-card" class="card" hidden>
     <h2>Not delivered yet</h2>
@@ -52,6 +79,8 @@
       <dt>Application</dt><dd>My Download Manager</dd>
       <dt>Browser</dt><dd id="info-browser">—</dd>
       <dt>Connection</dt><dd id="info-status">—</dd>
+      <dt>Automatic capture</dt><dd id="info-capture">—</dd>
+      <dt>Pending captures</dt><dd id="info-pending">—</dd>
       <dt>Version</dt><dd id="info-version">—</dd>
     </dl>
   </section>
