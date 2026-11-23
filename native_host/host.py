@@ -42,13 +42,25 @@ from mdm.browser_integration.request_validator import (  # noqa: E402
     ValidationError,
     redact_url,
     validate_add_download_request,
+    validate_capture_config_request,
+    validate_capture_decision,
+    validate_capture_mode,
+    validate_capture_reference,
+    validate_prepare_capture,
+    OPEN_APP_PAGES,
 )
 
 HOST_NAME = "com.mydownloadmanager.native"
-HOST_VERSION = "0.6.0"
+HOST_VERSION = "0.7.0"
 MAX_MESSAGE_SIZE = proto.MAX_MESSAGE_SIZE           # browser -> host (1 MB)
 MAX_RESPONSE_SIZE = proto.MAX_MESSAGE_SIZE          # host -> browser (Chromium limit is 1 MB)
-HOST_ACTIONS = frozenset({"ping", "add_download", "open_app"})
+HOST_ACTIONS = frozenset({
+    "ping", "add_download", "open_app",
+    # Stage 6B automatic capture
+    "prepare_capture", "capture_status", "commit_capture", "abort_capture",
+    "get_capture_config", "set_capture_mode", "claim_fallback",
+    "report_capture_decision",  # privacy-safe diagnostics (no URL)
+})
 CONFIG_FILENAME = "host_config.json"
 
 IPC_CONNECT_TIMEOUT = 3.0
@@ -162,12 +174,29 @@ def _from_ipc(action: str, request_id: Optional[str], ipc: Dict[str, Any]) -> Di
         resp.update(error_code=code, message=USER_MESSAGES.get(code, str(ipc.get("message") or "Request failed.")))
     if "version" in data:
         resp["app_version"] = str(data["version"])
-    if "download_id" in data:
+    if "download_id" in data and data.get("download_id"):
         resp["download"] = {
             "id": str(data.get("download_id")),
             "filename": str(data.get("filename") or ""),
         }
+    if action in CAPTURE_VALIDATORS:
+        resp["data"] = data  # capture state / configuration for the extension
     return resp
+
+
+# Stage 6B: capture actions are validated here, then forwarded with a FRESH IPC
+# request id each time (the capture's own request_id travels in the payload) so
+# that status polls are never answered from the IPC replay cache.
+CAPTURE_VALIDATORS = {
+    "prepare_capture": lambda m: validate_prepare_capture(m).to_payload(),
+    "capture_status": lambda m: validate_capture_reference(m, action="capture_status"),
+    "commit_capture": lambda m: validate_capture_reference(m, allow_url=True, action="commit_capture"),
+    "abort_capture": lambda m: validate_capture_reference(m, allow_reason=True, action="abort_capture"),
+    "claim_fallback": lambda m: validate_capture_reference(m, action="claim_fallback"),
+    "get_capture_config": validate_capture_config_request,
+    "set_capture_mode": validate_capture_mode,
+    "report_capture_decision": validate_capture_decision,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -266,9 +295,27 @@ def handle_message(message: Any, endpoint_path: Optional[Path] = None,
                         req.request_id, req.browser, redact_url(req.url))
             return _forward("add_download", req.request_id, req.to_payload(), endpoint_path)
 
-        # open_app
+        if action in CAPTURE_VALIDATORS:
+            try:
+                payload = CAPTURE_VALIDATORS[action](message)
+            except ValidationError as exc:
+                logger.info("Rejected %s: %s", action, exc.code)
+                return _error(action, request_id, exc.code, exc.message)
+            payload = {k: v for k, v in payload.items() if v is not None or k in ("filename", "mime",
+                                                                                 "total_bytes", "referrer")}
+            if action == "prepare_capture":
+                logger.info("Forwarding prepare_capture request=%s browser=%s url=%s",
+                            payload["request_id"], payload["browser"], redact_url(payload["url"]))
+            resp = _forward(action, secrets.token_hex(16), payload, endpoint_path)
+            resp["request_id"] = request_id if isinstance(request_id, str) and len(request_id) <= 128 else None
+            return resp
+
+        # open_app (optionally straight to a known page, e.g. the settings page)
+        page = message.get("page")
+        if page is not None and page not in OPEN_APP_PAGES:
+            return _error(action, request_id, "invalid_field", "Unknown page.")
         rid = secrets.token_hex(16)
-        resp = _forward("open_app", rid, {}, endpoint_path, ipc_action="show_window")
+        resp = _forward("open_app", rid, {"page": page} if page else {}, endpoint_path, ipc_action="show_window")
         resp["request_id"] = request_id if isinstance(request_id, str) else None
         if resp["ok"] or resp["error_code"] not in ("app_not_running", "invalid_endpoint"):
             return resp

@@ -235,3 +235,221 @@ def redact_url(url: Any) -> str:
         return f"{parts.scheme or '?'}://{host}/…"
     except ValueError:
         return "<unparseable>"
+
+
+# ---------------------------------------------------------------------------
+# Stage 6B: automatic capture messages
+# ---------------------------------------------------------------------------
+
+PREPARE_CAPTURE_FIELDS = frozenset({
+    "action", "request_id", "url", "filename", "mime", "total_bytes", "referrer",
+    "browser", "browser_download_id", "method", "danger", "incognito",
+})
+CAPTURE_MODES = frozenset({"disabled", "ask", "automatic"})
+OPEN_APP_PAGES = frozenset({"settings"})
+MAX_BROWSER_DOWNLOAD_ID = 2 ** 53
+_MIME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9!#$&^_.+-]{0,126}/[a-z0-9][a-z0-9!#$&^_.+-]{0,126}$")
+_REASON_PATTERN = re.compile(r"^[a-z_]{1,40}$")
+_VERSION_PATTERN = re.compile(r"^[0-9]{1,5}(\.[0-9]{1,5}){0,3}$")
+
+
+@dataclass(frozen=True)
+class CapturePrepareRequest:
+    request_id: str
+    url: str
+    browser: str
+    browser_download_id: int
+    filename: Optional[str] = None
+    mime: Optional[str] = None
+    total_bytes: Optional[int] = None
+    referrer: Optional[str] = None
+
+    def to_payload(self) -> Dict[str, Any]:
+        return {
+            "request_id": self.request_id, "url": self.url, "browser": self.browser,
+            "browser_download_id": self.browser_download_id, "filename": self.filename,
+            "mime": self.mime, "total_bytes": self.total_bytes, "referrer": self.referrer,
+            "method": "GET", "danger": "safe", "incognito": False,
+        }
+
+
+def _int_field(value: Any, name: str, *, minimum: int = 0, maximum: int = 2 ** 63 - 1) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or not (minimum <= value <= maximum):
+        raise ValidationError("invalid_field", f"{name} must be a non-negative integer.")
+    return value
+
+
+def validate_prepare_capture(message: Any) -> CapturePrepareRequest:
+    """Validates a ``prepare_capture`` message. Only safe, non-incognito GET
+    downloads with an http(s) URL and a bare filename are accepted."""
+    if not isinstance(message, dict):
+        raise ValidationError("invalid_message", "Request must be a JSON object.")
+    if set(message.keys()) - PREPARE_CAPTURE_FIELDS:
+        raise ValidationError("invalid_field", "Request contains unsupported fields.")
+    if message.get("action", "prepare_capture") != "prepare_capture":
+        raise ValidationError("unsupported_action", "Unsupported action.")
+
+    method = message.get("method")
+    if method != "GET":
+        raise ValidationError("unsupported_method",
+                              "Only downloads made with a plain GET request can be captured.")
+    if message.get("danger") != "safe":
+        raise ValidationError("dangerous_download",
+                              "The browser has not marked this download as safe; it stays in the browser.")
+    if message.get("incognito", False) is not False:
+        raise ValidationError("incognito_excluded", "Private-window downloads are never captured.")
+
+    mime = message.get("mime")
+    if mime is not None:
+        if not isinstance(mime, str):
+            raise ValidationError("invalid_field", "mime must be a string or null.")
+        mime = mime.split(";", 1)[0].strip().lower() or None
+        if mime is not None and not _MIME_PATTERN.match(mime):
+            mime = None  # informational only - drop rather than reject
+
+    total = message.get("total_bytes")
+    if total is not None:
+        if not isinstance(total, int) or isinstance(total, bool):
+            raise ValidationError("invalid_field", "total_bytes must be an integer or null.")
+        total = total if total >= 0 else None
+
+    return CapturePrepareRequest(
+        request_id=validate_request_id(message.get("request_id")),
+        url=validate_download_url(message.get("url")),
+        browser=validate_browser(message.get("browser")),
+        browser_download_id=_int_field(message.get("browser_download_id"), "browser_download_id",
+                                       maximum=MAX_BROWSER_DOWNLOAD_ID),
+        filename=validate_filename(message.get("filename")),
+        mime=mime,
+        total_bytes=total,
+        referrer=clean_referrer(message.get("referrer")),
+    )
+
+
+def validate_capture_reference(message: Any, *, allow_url: bool = False, allow_reason: bool = False,
+                               action: Optional[str] = None) -> Dict[str, Any]:
+    """Validates capture_status / commit_capture / abort_capture / claim_fallback."""
+    if not isinstance(message, dict):
+        raise ValidationError("invalid_message", "Request must be a JSON object.")
+    allowed = {"action", "request_id", "browser"}
+    if allow_url:
+        allowed.add("url")
+    if allow_reason:
+        allowed.add("reason")
+    if set(message.keys()) - allowed:
+        raise ValidationError("invalid_field", "Request contains unsupported fields.")
+    if action is not None and message.get("action", action) != action:
+        raise ValidationError("unsupported_action", "Unsupported action.")
+    out: Dict[str, Any] = {"request_id": validate_request_id(message.get("request_id"))}
+    if message.get("browser") is not None:
+        out["browser"] = validate_browser(message.get("browser"))
+    if allow_url:
+        out["url"] = validate_download_url(message.get("url"))
+    if allow_reason:
+        reason = message.get("reason", "other")
+        if not isinstance(reason, str) or not _REASON_PATTERN.match(reason):
+            reason = "other"
+        out["reason"] = reason
+    return out
+
+
+def validate_capture_config_request(message: Any) -> Dict[str, Any]:
+    """get_capture_config: who is asking and whether capture permissions are granted."""
+    if not isinstance(message, dict):
+        raise ValidationError("invalid_message", "Request must be a JSON object.")
+    if set(message.keys()) - {"action", "request_id", "browser", "capture_permissions", "extension_version"}:
+        raise ValidationError("invalid_field", "Request contains unsupported fields.")
+    out: Dict[str, Any] = {}
+    if message.get("browser") is not None:
+        out["browser"] = validate_browser(message.get("browser"))
+    perms = message.get("capture_permissions")
+    if perms is not None and not isinstance(perms, bool):
+        raise ValidationError("invalid_field", "capture_permissions must be a boolean.")
+    out["capture_permissions"] = perms
+    version = message.get("extension_version")
+    out["extension_version"] = version if isinstance(version, str) and _VERSION_PATTERN.match(version) else None
+    return out
+
+
+CAPTURE_DECISION_FIELDS = frozenset({
+    "at", "download_id", "browser", "resource_type", "method", "method_source", "from_cache", "filename",
+    "extension", "mime", "state", "paused", "by_extension", "initiator", "mode", "decision", "reason",
+})
+_TOKEN_PATTERN = re.compile(r"^[a-z_]{1,40}$")
+_METHOD_PATTERN = re.compile(r"^[A-Z]{1,12}$")
+_DECISION_EXTENSION_PATTERN = re.compile(r"^[a-z0-9]{1,10}$")
+MAX_DECISION_FILENAME = 120
+
+
+def validate_capture_decision(message: Any) -> Dict[str, Any]:
+    """``report_capture_decision``: a privacy-safe summary of one browser-side
+    capture decision, shown in the Browser Integration settings.
+
+    Only an allowlisted set of short, typed facts survives. There is no URL
+    field at all, and anything that looks like a URL is dropped, so a full
+    link, signed query string, cookie or token can never be stored.
+    """
+    if not isinstance(message, dict):
+        raise ValidationError("invalid_message", "Request must be a JSON object.")
+    if set(message.keys()) - {"action", "request_id", "browser", "decision"}:
+        raise ValidationError("invalid_field", "Request contains unsupported fields.")
+    raw = message.get("decision")
+    if not isinstance(raw, dict):
+        raise ValidationError("invalid_field", "decision must be an object.")
+    if set(raw.keys()) - CAPTURE_DECISION_FIELDS:
+        raise ValidationError("invalid_field", "decision contains unsupported fields.")
+
+    def token(name: str) -> Optional[str]:
+        v = raw.get(name)
+        return v if isinstance(v, str) and _TOKEN_PATTERN.match(v) else None
+
+    def flag(name: str) -> Optional[bool]:
+        v = raw.get(name)
+        return v if isinstance(v, bool) else None
+
+    filename = raw.get("filename")
+    if isinstance(filename, str):
+        filename = _CONTROL_CHARS.sub(" ", filename).strip()[:MAX_DECISION_FILENAME]
+        if "://" in filename or _FILENAME_FORBIDDEN.search(filename.replace(":", "")):
+            filename = None
+    else:
+        filename = None
+    method = raw.get("method")
+    mime = raw.get("mime")
+    ext = raw.get("extension")
+    did = raw.get("download_id")
+    at = raw.get("at")
+    out: Dict[str, Any] = {
+        "browser": validate_browser(message.get("browser")) if message.get("browser") is not None else None,
+        "download_id": did if isinstance(did, int) and not isinstance(did, bool) and 0 <= did <= MAX_BROWSER_DOWNLOAD_ID else None,
+        "at": at if isinstance(at, (int, float)) and not isinstance(at, bool) and at > 0 else None,
+        "resource_type": token("resource_type"),
+        "method": method if isinstance(method, str) and _METHOD_PATTERN.match(method) else None,
+        "method_source": token("method_source"),
+        "from_cache": flag("from_cache"),
+        "filename": filename or None,
+        "extension": ext if isinstance(ext, str) and _DECISION_EXTENSION_PATTERN.match(ext) else None,
+        "mime": mime if isinstance(mime, str) and _MIME_PATTERN.match(mime) else None,
+        "state": token("state"),
+        "paused": flag("paused"),
+        "by_extension": flag("by_extension"),
+        "initiator": token("initiator"),
+        "mode": token("mode"),
+        "decision": token("decision") or "other",
+        "reason": token("reason"),
+    }
+    return {"browser": out["browser"], "decision": out}
+
+
+def validate_capture_mode(message: Any) -> Dict[str, Any]:
+    if not isinstance(message, dict):
+        raise ValidationError("invalid_message", "Request must be a JSON object.")
+    if set(message.keys()) - {"action", "request_id", "browser", "mode"}:
+        raise ValidationError("invalid_field", "Request contains unsupported fields.")
+    mode = message.get("mode")
+    if mode not in CAPTURE_MODES:
+        raise ValidationError("invalid_field", "mode must be 'disabled', 'ask' or 'automatic'.")
+    out = {"mode": mode}
+    if message.get("browser") is not None:
+        out["browser"] = validate_browser(message.get("browser"))
+    return out

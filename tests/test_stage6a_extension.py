@@ -48,11 +48,20 @@ class ManifestV3Tests(unittest.TestCase):
         self.assertTrue({"contextMenus", "nativeMessaging", "storage"} <= perms)
         # "notifications" is the only addition, needed for the required browser notification.
         self.assertTrue(perms <= {"contextMenus", "nativeMessaging", "storage", "notifications"}, perms)
-        for forbidden in ("host_permissions", "optional_permissions", "content_scripts",
+        # Stage 6B evolution of the 6A guard: "optional_permissions" is no longer
+        # forbidden, but it is pinned to an exact allowlist below.
+        for forbidden in ("host_permissions", "content_scripts",
                           "externally_connectable", "web_accessible_resources"):
             self.assertNotIn(forbidden, self.manifest)
         for dangerous in ("cookies", "tabs", "downloads", "webRequest", "<all_urls>", "history", "debugger"):
             self.assertNotIn(dangerous, perms)
+        # Automatic capture permissions are OPTIONAL only (granted after a user click).
+        self.assertEqual(self.manifest.get("optional_permissions"), ["downloads", "webRequest"])
+        self.assertEqual(self.manifest.get("optional_host_permissions"), ["http://*/*", "https://*/*"])
+        text = json.dumps(self.manifest)
+        for never in ("cookies", "<all_urls>", "\"tabs\"", "history", "debugger", "webRequestBlocking",
+                      "declarativeNetRequest", "proxy", "privacy"):
+            self.assertNotIn(never, text)
 
     def test_referenced_files_exist(self):
         m = self.manifest
@@ -79,8 +88,12 @@ class ManifestV3Tests(unittest.TestCase):
         for js in list(EXT.rglob("*.js")):
             src = js.read_text(encoding="utf-8")
             for bad in ("eval(", "new Function", "innerHTML", "document.write", "importScripts(\"http",
-                        "chrome.cookies", "chrome.downloads", "chrome.extension."):
+                        "chrome.cookies", "chrome.extension."):
                 self.assertNotIn(bad, src, f"{bad} in {js.name}")
+            # Stage 6B evolution: the downloads API is used only by the service
+            # worker (single wiring point, behind an optional permission).
+            if js.name != "service_worker.js":
+                self.assertNotIn("chrome.downloads", src, f"chrome.downloads in {js.name}")
 
     def test_context_menu_declared_for_links_only(self):
         src = (EXT / "service_worker.js").read_text(encoding="utf-8")
@@ -89,11 +102,22 @@ class ManifestV3Tests(unittest.TestCase):
         self.assertIn('"com.mydownloadmanager.native"', (EXT / "lib" / "validation.js").read_text(encoding="utf-8"))
 
     def test_no_automatic_download_interception(self):
-        """Stage 6A must not intercept browser downloads (that is Stage 6B)."""
+        """Stage 6A forbade interception entirely. Stage 6B evolution: interception
+        exists only as opt-in automatic capture - off by default, behind optional
+        permissions, registered in one place - and onDeterminingFilename (which
+        would gate every single browser download) is still never used."""
         for js in EXT.rglob("*.js"):
             src = js.read_text(encoding="utf-8")
             self.assertNotIn("onDeterminingFilename", src)
-            self.assertNotIn("downloads.onCreated", src)
+            if js.name != "service_worker.js":
+                self.assertNotIn("downloads.onCreated", src, js.name)
+        sw = (EXT / "service_worker.js").read_text(encoding="utf-8")
+        self.assertEqual(sw.count("downloads.onCreated.addListener"), 1)
+        self.assertIn("chrome.downloads && chrome.downloads.onCreated", sw, "only once the permission exists")
+        self.assertNotIn("downloads", self.manifest["permissions"])
+        from mdm.browser_integration import capture_rules
+        self.assertEqual(capture_rules.effective_mode(capture_rules.default_config()), "disabled",
+                         "automatic capture is off unless the user enables it")
 
     def test_native_host_manifest_template(self):
         t = json.loads((NATIVE / "manifest.template.json").read_text(encoding="utf-8"))

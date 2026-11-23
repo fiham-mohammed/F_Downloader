@@ -59,7 +59,13 @@ HEADER_SIZE = HEADER.size
 # are rejected; combined with the request-id cache this prevents replay.
 MAX_CLOCK_SKEW_SECONDS = 300
 
-IPC_ACTIONS = frozenset({"ping", "add_download", "show_window"})
+IPC_ACTIONS = frozenset({
+    "ping", "add_download", "show_window",
+    # Stage 6B automatic capture (two-phase handshake + configuration)
+    "prepare_capture", "capture_status", "commit_capture", "abort_capture",
+    "get_capture_config", "set_capture_mode", "claim_fallback",
+    "report_capture_decision",  # privacy-safe diagnostics (no URL)
+})
 ENVELOPE_FIELDS = frozenset({"v", "token", "request_id", "ts", "action", "payload"})
 
 APP_DIR_NAME = "MyDownloadManager"

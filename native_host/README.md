@@ -43,7 +43,17 @@ powershell -ExecutionPolicy Bypass -File .\native_host\uninstall_native_host.ps1
 |---|---|---|
 | `ping` | `{"action":"ping"}` | `{"ok":true,"status":"connected","app_version":"0.6.0",...}` |
 | `add_download` | `{"action":"add_download","request_id":"…","url":"https://…","filename":null,"referrer":"https://…","page_title":"…","browser":"chrome"\|"edge"}` | `{"ok":true,"status":"accepted"\|"duplicate","download":{"id":"…","filename":"…"}}` |
-| `open_app` | `{"action":"open_app"}` | `{"ok":true,"status":"ok"\|"launched"}` or `open_not_supported` |
+| `open_app` | `{"action":"open_app"}`, optionally `"page":"settings"` | `{"ok":true,"status":"ok"\|"launched"}` or `open_not_supported` |
+| `get_capture_config` *(6B)* | `{"action":"get_capture_config","browser":"edge","capture_permissions":true,"extension_version":"0.7.0"}` | `data`: `mode`, `extensions`, `excluded_sites`, `pending`, `fallbacks` |
+| `set_capture_mode` *(6B)* | `{"action":"set_capture_mode","mode":"disabled"\|"ask"\|"automatic"}` | the updated configuration |
+| `prepare_capture` *(6B)* | `request_id`, `url`, `filename` (bare name), `mime`, `total_bytes`, `referrer`, `browser`, `browser_download_id`, and **`"method":"GET"`, `"danger":"safe"`, `"incognito":false`** (anything else is rejected before the app is contacted) | `data.state`: `probing` (or `declined` + `reason`) |
+| `capture_status` *(6B)* | `{"action":"capture_status","request_id":"…"}` | `data.state`: `probing` / `awaiting_user` / `approved` / `declined` / `expired` / `aborted` / `committed` |
+| `commit_capture` *(6B)* | `request_id` + the same `url` (verified against the stored SHA-256) | `status`: `committed` or `duplicate`, plus `download` |
+| `abort_capture` *(6B)* | `request_id` + `reason` | the final state (`committed` means: do **not** resume) |
+| `claim_fallback` *(6B)* | `request_id` of a captured download that failed with 401/403/407 | `data.url` for the browser to download itself |
+| `report_capture_decision` *(6B repair)* | `browser`, `decision`: a privacy-safe summary of one capture decision (filename, extension, MIME, method, resource type, state, initiator, decision, reason; **no URL field exists**) validated against a strict allowlist | `data.recorded`; shown in Settings › Browser Integration |
+
+Capture actions are forwarded with a **fresh IPC request ID** each time. The capture's own `request_id` travels in the payload, so status polls are never answered from the IPC replay cache. Stage 6B requires this host version (0.7.0): rebuild and re-run the installer after updating.
 
 Errors have the form `{"ok":false,"status":"error","error_code":"…","message":"…"}`. The codes are:
 

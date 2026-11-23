@@ -5,6 +5,7 @@ from PySide6.QtWidgets import QApplication
 from mdm.main_window import MainWindow
 from mdm.browser_integration import ipc_protocol
 from mdm.browser_integration.service import BrowserIntegrationService
+from mdm.browser_integration.capture_dialog import make_dialog_approval_handler
 
 
 def _configure_browser_integration_log():
@@ -38,6 +39,8 @@ def main():
         window.queue_mgr,
         show_window=window.bring_to_front,
         parent=window,
+        # Stage 6B: "Ask before downloading" uses a non-blocking confirmation dialog.
+        approval_handler=make_dialog_approval_handler(lambda: window),
     )
     window.attach_browser_integration(browser_integration)
     browser_integration.start()

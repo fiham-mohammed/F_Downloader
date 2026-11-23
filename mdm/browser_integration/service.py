@@ -21,8 +21,10 @@ from PySide6.QtCore import QObject, QThread, QCoreApplication, Signal
 
 from mdm import __version__ as APP_VERSION
 from mdm.browser_integration import ipc_protocol as proto
+from mdm.browser_integration.capture import CaptureManager
 from mdm.browser_integration.ipc_server import BrowserIpcServer
 from mdm.browser_integration.request_validator import (
+    OPEN_APP_PAGES,
     ValidationError,
     redact_url,
     validate_add_download_request,
@@ -49,10 +51,12 @@ class BrowserIntegrationService(QObject):
         queue_mgr: Any,
         *,
         folder_provider: Callable[[], Path | str] = default_download_folder,
-        show_window: Optional[Callable[[], None]] = None,
+        show_window: Optional[Callable[..., None]] = None,
         endpoint_path: Optional[Path] = None,
         parent: Optional[QObject] = None,
         server_kwargs: Optional[Dict[str, Any]] = None,
+        approval_handler: Optional[Callable[..., Any]] = None,
+        capture_kwargs: Optional[Dict[str, Any]] = None,
     ):
         super().__init__(parent)
         self.queue_mgr = queue_mgr
@@ -60,6 +64,15 @@ class BrowserIntegrationService(QObject):
         self._show_window = show_window
         # Used only when the QueueManager has no database (e.g. in-memory tests).
         self._memory_requests: Dict[str, Dict[str, Any]] = {}
+        # Stage 6B: automatic capture (uses the same QueueManager and database).
+        self.capture = CaptureManager(
+            queue_mgr,
+            folder_provider=folder_provider,
+            approval_handler=approval_handler,
+            parent=self,
+            **(capture_kwargs or {}),
+        )
+        self.capture.download_captured.connect(self.download_received)
         self.server = BrowserIpcServer(
             self.handle_request,
             endpoint_path=endpoint_path,
@@ -72,6 +85,7 @@ class BrowserIntegrationService(QObject):
         removed = self.purge_old_requests()
         if removed:
             logger.info("Removed %d expired browser request record(s).", removed)
+        self.capture.start()
         ok = self.server.start()
         if not ok:
             logger.warning("Browser integration is unavailable for this application instance.")
@@ -79,6 +93,7 @@ class BrowserIntegrationService(QObject):
 
     def stop(self) -> None:
         self.server.stop()
+        self.capture.stop()
 
     @property
     def is_running(self) -> bool:
@@ -96,10 +111,28 @@ class BrowserIntegrationService(QObject):
         if action == "show_window":
             if self._show_window is None:
                 raise ValidationError("unsupported_action", "Showing the window is not supported.")
-            self._show_window()
+            page = payload.get("page") if isinstance(payload, dict) else None
+            if page is not None:
+                if page not in OPEN_APP_PAGES:
+                    raise ValidationError("invalid_field", "Unknown page.")
+                self._show_window(page)
+            else:
+                self._show_window()
             return "ok", {}, "My Download Manager window shown."
         if action == "add_download":
             return self._add_download(payload)
+        capture_actions = {
+            "prepare_capture": self.capture.prepare,
+            "capture_status": self.capture.status,
+            "commit_capture": self.capture.commit,
+            "abort_capture": self.capture.abort,
+            "get_capture_config": self.capture.handle_get_config,
+            "set_capture_mode": self.capture.handle_set_mode,
+            "claim_fallback": self.capture.claim_fallback,
+            "report_capture_decision": self.capture.record_decision,
+        }
+        if action in capture_actions:
+            return capture_actions[action](payload if isinstance(payload, dict) else {})
         raise ValidationError("unsupported_action", "Unsupported action.")
 
     # ------------------------------------------------------------ idempotency

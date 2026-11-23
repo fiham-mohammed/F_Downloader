@@ -162,9 +162,13 @@ def parse_content_disposition(header_val: str | None) -> str | None:
                 pass
 
     # Try standard filename="value" or filename=value
-    filename_match = re.search(r'filename\s*=\s*(?:"([^"]+)"|([^;\s]+))', header_val, re.IGNORECASE)
+    # Quoted values may contain escaped quotes; unquoted values may contain spaces
+    # ("filename=Annual report.pdf") and end at the next ';'.
+    filename_match = re.search(r'(?:^|;)\s*filename\s*=\s*(?:"((?:[^"\\]|\\.)+)"|([^";][^;]*))',
+                               header_val, re.IGNORECASE)
     if filename_match:
-        raw_name = filename_match.group(1) or filename_match.group(2)
+        raw_name = (re.sub(r'\\(.)', r'\1', filename_match.group(1)) if filename_match.group(1)
+                    else (filename_match.group(2) or "").strip())
         if raw_name:
             # Unquote in case it's URL-encoded
             return unquote(raw_name.strip())

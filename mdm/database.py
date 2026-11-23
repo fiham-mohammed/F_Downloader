@@ -15,7 +15,17 @@ except Exception:
     DEFAULT_DATA_DIR = Path.home() / ".local" / "share" / "MyDownloadManager"
 
 DEFAULT_DB_FILE = DEFAULT_DATA_DIR / "downloads.db"
-CURRENT_SCHEMA_VERSION = 3  # v3 (Stage 6A): browser_requests idempotency table
+CURRENT_SCHEMA_VERSION = 4  # v3 (Stage 6A): browser_requests; v4 (Stage 6B): browser_captures
+
+# Stage 6B: automatic-capture handshake records.
+CAPTURE_ACTIVE_STATES = ("probing", "awaiting_user", "approved")
+CAPTURE_TERMINAL_STATES = ("declined", "aborted", "expired", "committed", "needs_browser", "fallback_claimed")
+CAPTURE_RETENTION_DAYS = 7
+
+
+class CaptureStateConflict(sqlite3.IntegrityError):
+    """Raised inside a transaction when a capture is not in the expected state;
+    being an IntegrityError it rolls the whole transaction back."""
 
 # Stage 6A: browser request idempotency retention policy.
 BROWSER_REQUEST_RETENTION_DAYS = 30
@@ -204,6 +214,139 @@ class DatabaseManager:
                 "CREATE INDEX IF NOT EXISTS idx_browser_requests_created ON browser_requests(created_at);"
             )
 
+        if from_version < 4 and to_version >= 4:
+            # Migration to Stage 6B schema (version 4): two-phase automatic-capture
+            # handshake. Additive only. The URL itself is never stored here (only a
+            # SHA-256 fingerprint); the browser re-sends it on commit.
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS browser_captures (
+                    request_id          TEXT PRIMARY KEY,
+                    browser             TEXT NOT NULL,
+                    browser_download_id INTEGER,
+                    url_sha256          TEXT NOT NULL,
+                    filename            TEXT,
+                    total_bytes         INTEGER,
+                    mode                TEXT NOT NULL,
+                    state               TEXT NOT NULL,
+                    reason              TEXT,
+                    download_id         TEXT,
+                    created_at          TEXT NOT NULL,
+                    updated_at          TEXT NOT NULL,
+                    expires_at          TEXT NOT NULL
+                );
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_browser_captures_state ON browser_captures(state);")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_browser_captures_browser_item "
+                "ON browser_captures(browser, browser_download_id);"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_browser_captures_download ON browser_captures(download_id);"
+            )
+
+    # --- Automatic capture handshake (Stage 6B) ---
+
+    def insert_capture(self, record: Dict[str, Any]) -> None:
+        """Inserts a new capture. Duplicate request_id raises sqlite3.IntegrityError."""
+        with self._write_lock:
+            conn = self.get_connection()
+            with conn:
+                conn.execute(
+                    """
+                    INSERT INTO browser_captures (
+                        request_id, browser, browser_download_id, url_sha256, filename, total_bytes,
+                        mode, state, reason, download_id, created_at, updated_at, expires_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?);
+                    """,
+                    (
+                        record["request_id"], record["browser"], record.get("browser_download_id"),
+                        record["url_sha256"], record.get("filename"), record.get("total_bytes"),
+                        record["mode"], record["state"], record.get("reason"),
+                        record["created_at"], record["created_at"], record["expires_at"],
+                    ),
+                )
+
+    def get_capture(self, request_id: str) -> Optional[Dict[str, Any]]:
+        row = self.get_connection().execute(
+            "SELECT * FROM browser_captures WHERE request_id = ?;", (request_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def find_active_capture(self, browser: str, browser_download_id: int) -> Optional[Dict[str, Any]]:
+        placeholders = ",".join("?" * len(CAPTURE_ACTIVE_STATES))
+        row = self.get_connection().execute(
+            f"SELECT * FROM browser_captures WHERE browser = ? AND browser_download_id = ? "
+            f"AND state IN ({placeholders}) ORDER BY created_at DESC LIMIT 1;",
+            (browser, browser_download_id, *CAPTURE_ACTIVE_STATES),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def find_capture_by_download(self, download_id: str) -> Optional[Dict[str, Any]]:
+        row = self.get_connection().execute(
+            "SELECT * FROM browser_captures WHERE download_id = ? LIMIT 1;", (download_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def list_captures(self, states: Tuple[str, ...], limit: int = 100) -> List[Dict[str, Any]]:
+        placeholders = ",".join("?" * len(states))
+        rows = self.get_connection().execute(
+            f"SELECT * FROM browser_captures WHERE state IN ({placeholders}) "
+            f"ORDER BY updated_at DESC LIMIT ?;",
+            (*states, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    _CAPTURE_UPDATABLE = ("filename", "total_bytes", "reason", "expires_at")
+
+    def transition_capture(self, request_id: str, from_states: Tuple[str, ...], to_state: str,
+                           **fields: Any) -> bool:
+        """Atomically moves a capture from one of ``from_states`` to ``to_state``.
+        Returns False (and changes nothing) if the capture is in any other state."""
+        sets = ["state = ?", "updated_at = ?"]
+        values: List[Any] = [to_state, datetime.now().isoformat()]
+        for key, value in fields.items():
+            if key not in self._CAPTURE_UPDATABLE:
+                raise ValueError(f"Field {key!r} cannot be updated.")
+            sets.append(f"{key} = ?")
+            values.append(value)
+        placeholders = ",".join("?" * len(from_states))
+        with self._write_lock:
+            conn = self.get_connection()
+            with conn:
+                cur = conn.execute(
+                    f"UPDATE browser_captures SET {', '.join(sets)} "
+                    f"WHERE request_id = ? AND state IN ({placeholders});",
+                    (*values, request_id, *from_states),
+                )
+                return cur.rowcount == 1
+
+    def expire_captures(self, now: Optional[datetime] = None) -> int:
+        """Marks active captures whose deadline has passed as expired."""
+        stamp = (now or datetime.now()).isoformat()
+        placeholders = ",".join("?" * len(CAPTURE_ACTIVE_STATES))
+        with self._write_lock:
+            conn = self.get_connection()
+            with conn:
+                return conn.execute(
+                    f"UPDATE browser_captures SET state = 'expired', reason = COALESCE(reason, 'timeout'), "
+                    f"updated_at = ? WHERE state IN ({placeholders}) AND expires_at < ?;",
+                    (stamp, *CAPTURE_ACTIVE_STATES, stamp),
+                ).rowcount
+
+    def purge_captures(self, max_age_days: int = CAPTURE_RETENTION_DAYS, now: Optional[datetime] = None) -> int:
+        """Deletes finished capture records older than ``max_age_days``. Active
+        records and all download rows are never deleted."""
+        from datetime import timedelta
+        cutoff = ((now or datetime.now()) - timedelta(days=max_age_days)).isoformat()
+        placeholders = ",".join("?" * len(CAPTURE_TERMINAL_STATES))
+        with self._write_lock:
+            conn = self.get_connection()
+            with conn:
+                return conn.execute(
+                    f"DELETE FROM browser_captures WHERE state IN ({placeholders}) AND updated_at < ?;",
+                    (*CAPTURE_TERMINAL_STATES, cutoff),
+                ).rowcount
+
     # --- Browser request idempotency (Stage 6A) ---
 
     @staticmethod
@@ -329,6 +472,16 @@ class DatabaseManager:
 
                 if browser_request is not None:
                     self._insert_browser_request(cur, d.id, browser_request)
+                    if browser_request.get("capture_commit"):
+                        # Stage 6B: approved -> committed in the SAME transaction as
+                        # the download row. Any other state rolls everything back.
+                        cur.execute(
+                            "UPDATE browser_captures SET state = 'committed', download_id = ?, updated_at = ? "
+                            "WHERE request_id = ? AND state = 'approved';",
+                            (d.id, datetime.now().isoformat(), browser_request["request_id"]),
+                        )
+                        if cur.rowcount != 1:
+                            raise CaptureStateConflict("Capture is not in the approved state.")
             return True
 
     def get_download(self, download_id: str) -> Optional[DownloadModel]:
